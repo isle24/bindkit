@@ -1,0 +1,4140 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+dbbind — 数据库连接绑定管理器
+
+绑定一次，之后 AI / 脚本免密直接用别名操作数据库。
+
+首选入口是**配置文件**（手写一次，随仓库走）：
+    ~/.dbbind/config.json        全局配置（存密码的地方）
+    <项目>/.dbbind.json          项目配置（从当前目录逐级向上找第一个）
+    $DBBIND_CONFIG / --config    最高优先，方便切环境
+另外 `dbbind add` 会把连接写进 ~/.dbbind/databases.json（优先级高于配置文件）。
+
+常用命令：
+    dbbind list --json                       列出所有别名（agent 首选）
+    dbbind exec --json <别名> "select ..."   执行 SQL，结构化输出
+    dbbind dbinfo / databases / tables / columns / schema <别名>
+    dbbind test [<别名>]                     连通性测试
+    dbbind doctor                            环境 + 配置自检
+    dbbind config path|show|init|validate    配置文件相关
+
+安全设计：
+  * 默认只读；`--write` 只放行 DML，DDL 仍拒绝（DDL_BLOCKED）；`--unsafe` 才放行结构变更
+  * 密码绝不进 argv：本机走 MYSQL_PWD / PGPASSWORD 环境变量；ssh / docker 通道
+    走 stdin 首行由远端 shell read 进环境变量，命令行里看不到密码
+  * 状态文件 0600、目录 0700；show / 日志默认打码，绝不回显展开后的密码
+  * 只读别名再加一道服务端防线：PGOPTIONS default_transaction_read_only、
+    MySQL --init-command、sqlite3 -readonly（见 CONTRACT §4.2.3）
+
+依赖：系统自带 python3（全标准库）+ mysql / psql / sqlite3 客户端
+"""
+
+import argparse
+import csv as csv_mod
+import getpass
+import io
+import json
+import os
+import re
+import shlex
+import shutil
+import sqlite3 as sqlite_mod
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+from urllib.parse import quote
+
+VERSION = "1.0.0"
+PROG = "dbbind"
+
+# ---------------------------------------------------------------------------
+# 路径与常量
+# ---------------------------------------------------------------------------
+
+BASE_DIR = os.path.join(os.path.expanduser("~"), ".dbbind")
+STATE_FILE = os.path.join(BASE_DIR, "databases.json")
+GLOBAL_CONFIG = os.path.join(BASE_DIR, "config.json")
+AGENT_FILE = os.path.join(BASE_DIR, "AGENT.md")
+PROJECT_CONFIG_NAME = ".dbbind.json"
+CONFIG_ENV = "DBBIND_CONFIG"
+
+ENGINE_NAMES = ("mysql", "postgres", "sqlite")
+VIA_NAMES = ("local", "ssh", "docker")
+ORIGIN_NAMES = ("state", "config", "merged")
+CLIENT_NAMES = {"mysql": "mysql", "postgres": "psql", "sqlite": "sqlite3"}
+ENV_CLIENT = {"mysql": "DBBIND_MYSQL", "postgres": "DBBIND_PSQL", "sqlite": "DBBIND_SQLITE3"}
+DEFAULT_PORTS = {"mysql": 3306, "postgres": 5432, "sqlite": None}
+DEFAULT_LIMIT = 1000
+DEFAULT_TIMEOUT = 120
+
+# 客户端发现：环境变量覆盖 > 常见安装前缀 > PATH 兜底（不硬编码单一绝对路径）
+CLIENT_CANDIDATES = {
+    "mysql": [
+        "/opt/homebrew/opt/mysql-client/bin/mysql",
+        "/opt/homebrew/opt/mariadb/bin/mysql",
+        "/usr/local/opt/mysql-client/bin/mysql",
+        "/usr/local/opt/mariadb/bin/mysql",
+        "/opt/homebrew/bin/mysql",
+        "/usr/local/bin/mysql",
+        "/usr/bin/mysql",
+    ],
+    "postgres": [
+        "/opt/homebrew/opt/libpq/bin/psql",
+        "/usr/local/opt/libpq/bin/psql",
+        "/opt/homebrew/bin/psql",
+        "/usr/local/bin/psql",
+        "/Applications/Postgres.app/Contents/Versions/latest/bin/psql",
+        "/usr/bin/psql",
+    ],
+    "sqlite": [
+        "/usr/bin/sqlite3",
+        "/opt/homebrew/bin/sqlite3",
+        "/usr/local/bin/sqlite3",
+    ],
+}
+
+C_OK = "\033[32m"
+C_WARN = "\033[33m"
+C_ERR = "\033[31m"
+C_DIM = "\033[2m"
+C_BOLD = "\033[1m"
+C_OFF = "\033[0m"
+
+# 已知字段（未知字段只警告不中断：防手写把 password 拼成 passwd 后静默失效）
+KNOWN_TOP_FIELDS = {"version", "defaults", "databases"}
+KNOWN_DEFAULT_FIELDS = {"read_only", "limit"}
+KNOWN_DB_FIELDS = {
+    "name", "engine", "host", "port", "user", "password", "database", "file",
+    "via_ssh", "docker_exec", "read_only", "created_at", "source", "origin",
+}
+
+
+# ---------------------------------------------------------------------------
+# 输出 / 错误
+# ---------------------------------------------------------------------------
+
+JSON_MODE = False
+_SECRETS = set()
+
+
+def set_json_mode(flag):
+    global JSON_MODE
+    JSON_MODE = bool(flag)
+
+
+def _color():
+    return sys.stdout.isatty() and not JSON_MODE
+
+
+def human(msg=""):
+    """人类可读信息：--json 时一律走 stderr，保证 stdout 只有 JSON。"""
+    print(msg, file=sys.stderr if JSON_MODE else sys.stdout)
+
+
+def info(msg):
+    human("%s→ %s%s" % (C_DIM, msg, C_OFF) if _color() else "     " + msg)
+
+
+def ok(msg):
+    human("%s✅ %s%s" % (C_OK, msg, C_OFF) if _color() else "OK   " + msg)
+
+
+def warn(msg):
+    sys.stdout.flush()
+    print("%s⚠️  %s%s" % (C_WARN, msg, C_OFF) if _color() else "WARN " + msg,
+          file=sys.stderr)
+    sys.stderr.flush()
+
+
+def bold(msg):
+    return ("%s%s%s" % (C_BOLD, msg, C_OFF)) if _color() else msg
+
+
+def register_secret(value):
+    if value:
+        _SECRETS.add(value)
+
+
+def redact(text):
+    """任何要打印的文本都过一遍：密码绝不进日志/报错。"""
+    if text is None:
+        return text
+    if not isinstance(text, str):
+        text = str(text)
+    for s in _SECRETS:
+        if s and s in text:
+            text = text.replace(s, "***")
+    text = re.sub(r"(?i)(\b(?:password|identified\s+by)\s+(?:E)?)(?:'(?:''|\\.|[^'])*'|\"(?:\"\"|[^\"])*\")",
+                  r"\1***", text)
+    text = re.sub(r"(?i)(\b[a-z][a-z0-9+.-]*://[^\s/:@]+:)[^\s/@]+(?=@)",
+                  r"\1***", text)
+    text = re.sub(r"(?i)\b(password|passwd|pwd|token|secret)(\s*[:=]\s*)([^\s,;\"'}]+)",
+                  r"\1\2***", text)
+    return text
+
+
+def emit_json(obj):
+    print(json.dumps(obj, ensure_ascii=False, indent=2, default=str))
+
+
+EXIT_OK, EXIT_ERR, EXIT_USAGE, EXIT_READONLY, EXIT_NOTFOUND = 0, 1, 2, 3, 4
+EXIT_AUTHZ, EXIT_APPROVAL = 5, 6        # bindconsole 契约 §5.1
+CODE_EXIT = {
+    "USAGE": EXIT_USAGE,
+    "READONLY_BLOCKED": EXIT_READONLY,
+    "DDL_BLOCKED": EXIT_READONLY,
+    "NOT_FOUND": EXIT_NOTFOUND,
+    "AUTHZ_DENIED": EXIT_AUTHZ,
+    "APPROVAL_REQUIRED": EXIT_APPROVAL,
+}
+
+
+class DbbindError(Exception):
+    def __init__(self, code, message, hint=None, exit_code=None, extra=None):
+        Exception.__init__(self, message)
+        self.code = code
+        self.message = message
+        self.hint = hint
+        self.exit_code = exit_code if exit_code is not None else CODE_EXIT.get(code, EXIT_ERR)
+        self.extra = extra or {}          # 策略闸门：request_id / expires_at
+        self.gate_error = False           # 人类可读输出里是否额外打印 code
+
+
+def die(code, message, hint=None, exit_code=None):
+    raise DbbindError(code, message, hint, exit_code)
+
+
+def error_payload(code, message, hint=None, extra=None):
+    err = {"code": code, "message": redact(message)}
+    if hint:
+        err["hint"] = redact(hint)
+    for key in ("request_id", "expires_at"):
+        if extra and extra.get(key):
+            err[key] = extra[key]
+    return {"ok": False, "error": err}
+
+
+def report_error(exc):
+    extra = getattr(exc, "extra", None)
+    payload = error_payload(exc.code, exc.message, exc.hint, extra)
+    if JSON_MODE:
+        emit_json(payload)
+    else:
+        sys.stdout.flush()
+        head = "%s❌ %s%s" % (C_ERR, payload["error"]["message"], C_OFF) if _color() \
+            else "ERROR " + payload["error"]["message"]
+        print(head, file=sys.stderr)
+        if getattr(exc, "gate_error", False):
+            # 契约 §5.1：人类可读输出也要打印 code + request_id
+            print("     code: %s" % payload["error"]["code"], file=sys.stderr)
+            if payload["error"].get("request_id"):
+                print("     request_id: %s" % payload["error"]["request_id"],
+                      file=sys.stderr)
+            if payload["error"].get("expires_at"):
+                print("     过期时间: %s" % payload["error"]["expires_at"],
+                      file=sys.stderr)
+        if exc.hint:
+            print("     " + redact(exc.hint), file=sys.stderr)
+        sys.stderr.flush()
+
+
+class _Parser(argparse.ArgumentParser):
+    """argparse 的用法错误也按契约输出（--json 时给 JSON 错误对象，退出码 2）。"""
+
+    def error(self, message):
+        if "--json" in sys.argv:
+            emit_json(error_payload("USAGE", message, "用 dbbind --help 查看用法"))
+            sys.exit(EXIT_USAGE)
+        self.print_usage(sys.stderr)
+        print("%s: error: %s" % (self.prog, message), file=sys.stderr)
+        sys.exit(EXIT_USAGE)
+
+
+# ---------------------------------------------------------------------------
+# 容错 JSON 解析（// 与 /* */ 注释、尾随逗号；报错带 路径+行号+列号+原文）
+# ---------------------------------------------------------------------------
+
+def preprocess_jsonc(text):
+    """把 JSONC 预处理成标准 JSON，同时保留「输出位置 → 原文位置」映射。
+
+    只删注释、删尾随逗号；字符串内的内容原样保留（不会把串里的 // 当注释）。
+    """
+    out, mapping = [], []
+    i, n = 0, len(text)
+    in_str = False
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            mapping.append(i)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                mapping.append(i + 1)
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            mapping.append(i)
+            i += 1
+            continue
+        if text.startswith("//", i):
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if text.startswith("/*", i):
+            i += 2
+            while i < n and not text.startswith("*/", i):
+                if text[i] == "\n":              # 保留换行，行号才不会漂
+                    out.append("\n")
+                    mapping.append(i)
+                i += 1
+            i += 2
+            continue
+        out.append(ch)
+        mapping.append(i)
+        i += 1
+
+    clean = "".join(out)
+    clean2, map2 = [], []
+    k, m = 0, len(clean)
+    while k < m:
+        ch = clean[k]
+        if ch == ",":
+            j = k + 1
+            while j < m and clean[j] in " \t\r\n":
+                j += 1
+            if j < m and clean[j] in "}]":
+                k += 1                            # 尾随逗号：丢掉
+                continue
+        clean2.append(ch)
+        map2.append(mapping[k])
+        k += 1
+    return "".join(clean2), map2
+
+
+def _line_col(text, idx):
+    idx = max(0, min(idx, len(text)))
+    line = text.count("\n", 0, idx) + 1
+    start = text.rfind("\n", 0, idx) + 1
+    end = text.find("\n", idx)
+    if end < 0:
+        end = len(text)
+    snippet = text[start:end]
+    if len(snippet) > 160:
+        snippet = snippet[:157] + "..."
+    return line, idx - start + 1, snippet
+
+
+def parse_jsonc(text, path):
+    """解析容错 JSON；失败时抛带 文件/行/列/原文 的 STATE_CORRUPT。"""
+    clean, mapping = preprocess_jsonc(text)
+    try:
+        return json.loads(clean)
+    except ValueError as e:
+        pos = getattr(e, "pos", 0) or 0
+        orig = mapping[pos] if pos < len(mapping) else len(text)
+        line, col, snippet = _line_col(text, orig)
+        msg = getattr(e, "msg", None) or str(e)
+        die("STATE_CORRUPT",
+            "配置文件语法错误：%s 第 %d 行第 %d 列\n  %s\n  %s"
+            % (path, line, col, redact(snippet), redact(msg)),
+            "常见笔误：少了逗号、字符串用了单引号、括号没配对")
+
+
+# ---------------------------------------------------------------------------
+# 环境变量插值
+# ---------------------------------------------------------------------------
+
+_ENV_RE = re.compile(r"\$(\$|[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})")
+
+
+def expand_env(value, missing, field=None):
+    """$VAR / ${VAR} 展开；$$ 转义为字面 $；未定义的变量记入 missing。"""
+    if not isinstance(value, str):
+        return value
+
+    def repl(m):
+        token = m.group(1)
+        if token == "$":
+            return "$"
+        name = token[1:-1] if token.startswith("{") else token
+        if name in os.environ:
+            return os.environ[name]
+        missing.append((field, name))
+        return ""
+
+    return _ENV_RE.sub(repl, value)
+
+
+# ---------------------------------------------------------------------------
+# 配置来源与字段级合并
+# ---------------------------------------------------------------------------
+
+def find_project_config(start=None):
+    """从 cwd 逐级向上找第一个 .dbbind.json。"""
+    d = os.path.abspath(start or os.getcwd())
+    while True:
+        p = os.path.join(d, PROJECT_CONFIG_NAME)
+        if os.path.isfile(p):
+            return p
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def config_sources(explicit=None, cwd=None):
+    """按优先级从低到高返回 [(path, kind)]。"""
+    src = [(GLOBAL_CONFIG, "global")]
+    proj = find_project_config(cwd)
+    if proj:
+        src.append((proj, "project"))
+    src.append((STATE_FILE, "state"))
+    extra = explicit or os.environ.get(CONFIG_ENV)
+    if extra:
+        src.append((os.path.abspath(os.path.expanduser(extra)), "extra"))
+    return src
+
+
+def _split_db_payload(payload, path, kind):
+    """把一份配置文件拆成 (defaults, aliases, unknown_fields)。"""
+    defaults, aliases, unknown = {}, {}, []
+    if payload is None:
+        return defaults, aliases, unknown
+    if not isinstance(payload, dict):
+        die("STATE_CORRUPT", "配置文件顶层必须是 JSON 对象：%s" % path,
+            '示例：{"version": 1, "databases": {"别名": {...}}}')
+    for key in payload:
+        if key not in KNOWN_TOP_FIELDS:
+            unknown.append("%s: 顶层未知字段 %r（已知：version/defaults/databases）"
+                           % (path, key))
+    d = payload.get("defaults")
+    if isinstance(d, dict):
+        for key, val in d.items():
+            if key in KNOWN_DEFAULT_FIELDS:
+                defaults[key] = val
+            else:
+                unknown.append("%s: defaults 里未知字段 %r（已知：read_only/limit）"
+                               % (path, key))
+    elif d is not None:
+        unknown.append("%s: defaults 应该是对象" % path)
+    dbs = payload.get("databases")
+    if dbs is None:
+        dbs = {}
+    if not isinstance(dbs, dict):
+        die("STATE_CORRUPT", "配置文件里的 databases 必须是对象：%s" % path,
+            '形如 "databases": { "别名": { "engine": "mysql", ... } }')
+    for alias, item in dbs.items():
+        if not isinstance(item, dict):
+            unknown.append("%s: 别名 %r 的值不是对象，已忽略" % (path, alias))
+            continue
+        bad_keys = []
+        for key in item:
+            if key not in KNOWN_DB_FIELDS:
+                bad_keys.append(key)
+                unknown.append("%s: 别名 %r 的未知字段 %r（已忽略，可能是拼错了；已知：%s）"
+                               % (path, alias, key, "/".join(sorted(KNOWN_DB_FIELDS))))
+        rec = dict(item)
+        rec["_file"] = path
+        rec["_unknown"] = bad_keys
+        aliases[alias] = rec
+    return defaults, aliases, unknown
+
+
+def load_effective_config(explicit=None, cwd=None):
+    """统一配置入口：多层加载 + 字段级合并 + $ENV 展开。
+
+    优先级（低 → 高）：引擎默认值 < ~/.dbbind/config.json < 项目 .dbbind.json
+                     < ~/.dbbind/databases.json < $DBBIND_CONFIG / --config
+    """
+    files = []
+    merged = {}              # 别名 → 字段 → (值, 文件路径, kind)
+    merged_defaults = {}
+    unknown_fields = []
+    unknown_by_alias = {}    # 别名 → [(字段/描述, 文件)]：进 list --json 的 warnings[]
+    missing_env = []         # [(别名, 字段, 变量名)]
+    explicit_path = os.path.abspath(os.path.expanduser(explicit)) if explicit else None
+
+    for path, kind in config_sources(explicit_path, cwd):
+        meta = {"path": path, "kind": kind, "exists": False, "readable": False,
+                "aliases": [], "error": None, "unknown_fields": [], "defaults": {}}
+        files.append(meta)
+        if not os.path.exists(path):
+            if kind == "extra":
+                die("NOT_FOUND", "指定的配置文件不存在：%s" % path,
+                    "检查 --config / $%s 指向的路径" % CONFIG_ENV)
+            continue
+        meta["exists"] = True
+        if not os.access(path, os.R_OK):
+            meta["error"] = "不可读"
+            if kind == "extra":
+                die("STATE_CORRUPT", "配置文件不可读：%s" % path)
+            continue
+        meta["readable"] = True
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            meta["error"] = redact(str(e))
+            continue
+        payload = parse_jsonc(text, path)
+        defaults, aliases, unknown = _split_db_payload(payload, path, kind)
+        meta["defaults"] = defaults
+        meta["aliases"] = sorted(aliases)
+        meta["unknown_fields"] = unknown
+        unknown_fields.extend(unknown)
+        merged_defaults.update(defaults)          # 后加载的覆盖前者
+        file_level = [u for u in unknown if ("别名" not in u)]
+        for alias, item in aliases.items():
+            slot = merged.setdefault(alias, {})
+            for key, val in item.items():
+                if key == "_file":
+                    continue
+                if key == "_unknown":
+                    unknown_by_alias.setdefault(alias, []).extend((f, path) for f in val)
+                    continue
+                slot[key] = (val, path, kind)     # 显式出现的字段才覆盖
+            for u in file_level:
+                unknown_by_alias.setdefault(alias, []).append((u, path))
+
+    defaults = {"read_only": True, "limit": DEFAULT_LIMIT}
+    defaults.update(merged_defaults)
+
+    entries = {}
+    for alias, slot in merged.items():
+        raw, sources = {}, {}
+        for key, (val, path, kind) in slot.items():
+            if key == "_file":
+                continue
+            raw[key] = val
+            sources[key] = (path, kind)
+        entries[alias] = resolve_entry(alias, raw, sources, defaults, missing_env,
+                                       unknown_by_alias.get(alias, []))
+    return {
+        "defaults": defaults,
+        "entries": entries,
+        "files": files,
+        "unknown_fields": unknown_fields,
+        "missing_env": missing_env,
+        "explicit_config": explicit_path,
+    }
+
+
+def _as_bool(val, default=True):
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        s = val.strip().lower()
+        if s in ("true", "yes", "on", "1"):
+            return True
+        if s in ("false", "no", "off", "0"):
+            return False
+    return default
+
+
+def resolve_entry(alias, raw, sources, defaults, missing_env, unknown_fields=None):
+    """合并后的原始字段 → 可执行条目（补默认值、展开 $ENV、判定 usable）。"""
+    warnings = []
+    seen_unknown = set()
+    for field, path in (unknown_fields or []):
+        if field in seen_unknown:
+            continue
+        seen_unknown.add(field)
+        if "别名" in field or "未知字段" in field:
+            warnings.append(field)             # 已经是完整描述
+        else:
+            warnings.append("配置文件 %s 里存在未知字段 %r（已忽略，可能是拼错了）"
+                            % (path, field))
+    kinds = {sources[k][1] for k in sources}
+    origin = "state" if kinds == {"state"} else ("merged" if "state" in kinds else "config")
+    # config_file：定义了这个别名的最高优先级非 state 文件
+    config_file = None
+    for key in ("engine", "host", "file", "port", "user", "password", "database",
+                "via_ssh", "docker_exec", "read_only", "name"):
+        if key in sources and sources[key][1] != "state":
+            config_file = sources[key][0]
+            break
+
+    missing_here = []
+    vals = {}
+    for key, val in raw.items():
+        vals[key] = expand_env(val, missing_here, key) if isinstance(val, str) else val
+    for field, name in missing_here:
+        missing_env.append((alias, field, name))
+
+    engine = vals.get("engine")
+    engine = engine.strip().lower() if isinstance(engine, str) else None
+    if engine not in ENGINE_NAMES:
+        return _make_entry(alias, vals, origin, config_file, warnings, missing_here,
+                           defaults, False,
+                           "engine 取值非法：%r（只能是 %s）"
+                           % (raw.get("engine"), "|".join(ENGINE_NAMES)))
+
+    port = vals.get("port")
+    if port in (None, ""):
+        port = DEFAULT_PORTS.get(engine)
+    else:
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            port = DEFAULT_PORTS.get(engine)
+
+    read_only = defaults.get("read_only", True)
+    if vals.get("read_only") is not None:
+        read_only = _as_bool(vals["read_only"], read_only)
+
+    via_ssh = vals.get("via_ssh") or None
+    docker_exec = vals.get("docker_exec") or None
+    user = vals.get("user") or None
+    host = vals.get("host") or None
+    database = vals.get("database") or None
+    password = vals.get("password")
+    if password is not None and not isinstance(password, str):
+        password = str(password)
+
+    file_path = vals.get("file") or None
+    if engine == "sqlite" and file_path:
+        if not (via_ssh or docker_exec):
+            file_path = os.path.abspath(os.path.expanduser(str(file_path)))
+        elif str(file_path).startswith("~"):
+            warnings.append("远端 sqlite 路径不做 ~ 展开（由远端解释）：%s" % file_path)
+
+    missing_fields = []
+    if engine in ("mysql", "postgres"):
+        if not host:
+            missing_fields.append("host")
+        if not user:
+            missing_fields.append("user")
+    if engine == "sqlite" and not file_path:
+        missing_fields.append("file")
+
+    if missing_here:
+        names = "、".join(sorted({"$%s" % n for _, n in missing_here}))
+        reason = "环境变量 %s 未设置（配置文件里引用了它）" % names
+    elif missing_fields:
+        reason = "配置缺少必填字段：%s" % "、".join(missing_fields)
+    else:
+        reason = None
+
+    via = "docker" if docker_exec else ("ssh" if via_ssh else "local")
+    client_found, client_path, client_reason = resolve_runner(engine, via)
+    if reason is None and not client_found:
+        reason = client_reason
+        usable_code = "CLIENT_MISSING"
+    usable_code = "USAGE"
+    if reason is None and engine == "sqlite" and via == "local" and not os.path.isfile(file_path):
+        reason = ("sqlite 数据库文件不存在：%s（先创建它，或指向已有文件）" % file_path)
+        usable_code = "CONNECT_FAILED"
+
+    if engine == "sqlite":
+        host = port = user = password = None
+
+    has_password = bool(password)
+    if any(field == "password" for field, _ in missing_here):
+        has_password = False
+    entry = _make_entry(alias, vals, origin, config_file, warnings, missing_here,
+                        defaults, reason is None, reason)
+    entry["usable_code"] = usable_code
+    entry.update({
+        "engine": engine, "host": host, "port": port, "user": user,
+        "password": password, "database": database, "file": file_path,
+        "via_ssh": via_ssh, "docker_exec": docker_exec,
+        "read_only": bool(read_only), "via": via,
+        "created_at": vals.get("created_at"), "source": vals.get("source"),
+        "has_password": has_password, "client_found": bool(client_found),
+        "client_path": client_path,
+    })
+    return entry
+
+
+def _make_entry(alias, vals, origin, config_file, warnings, missing_here, defaults,
+                usable, reason):
+    return {
+        "name": alias,
+        "engine": vals.get("engine"),
+        "host": vals.get("host"),
+        "port": vals.get("port"),
+        "user": vals.get("user"),
+        "password": vals.get("password"),
+        "database": vals.get("database"),
+        "file": vals.get("file"),
+        "via_ssh": vals.get("via_ssh"),
+        "docker_exec": vals.get("docker_exec"),
+        "read_only": bool(defaults.get("read_only", True)),
+        "via": "docker" if vals.get("docker_exec") else
+               ("ssh" if vals.get("via_ssh") else "local"),
+        "created_at": vals.get("created_at"),
+        "source": vals.get("source"),
+        "origin": origin,
+        "config_file": config_file,
+        "has_password": bool(vals.get("password")),
+        "client_found": False,
+        "client_path": None,
+        "usable": bool(usable),
+        "usable_reason": reason,
+        "warnings": list(warnings),
+        "missing_env": ["$%s" % n for _, n in missing_here],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 客户端 / 通道发现
+# ---------------------------------------------------------------------------
+
+_CLIENT_CACHE = {}
+
+
+def find_client(engine):
+    """返回 (路径 or None, 尝试过的位置列表)。$ENV 优先，其次常见前缀，最后 PATH。"""
+    if engine in _CLIENT_CACHE:
+        return _CLIENT_CACHE[engine]
+    tried = []
+    env_var = ENV_CLIENT.get(engine)
+    override = os.environ.get(env_var) if env_var else None
+    if override:
+        tried.append("%s ($%s)" % (override, env_var))
+        p = os.path.expanduser(override)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            _CLIENT_CACHE[engine] = (p, tried)
+            return p, tried
+    for cand in CLIENT_CANDIDATES.get(engine, []):
+        tried.append(cand)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            _CLIENT_CACHE[engine] = (cand, tried)
+            return cand, tried
+    name = CLIENT_NAMES.get(engine)
+    wh = shutil.which(name) if name else None
+    tried.append("$PATH 里的 %s" % name)
+    _CLIENT_CACHE[engine] = (wh, tried)
+    return wh, tried
+
+
+def resolve_runner(engine, via):
+    """判定执行通道是否可用 → (found, path, reason)。
+
+    本地通道看引擎客户端；ssh / docker 通道看传输工具（客户端在远端/容器里，
+    本地无从检查），找不到时给出可执行的原因写进 usable_reason。
+    """
+    if via == "local":
+        path, _ = find_client(engine)
+        if path:
+            return True, path, None
+        pkg = "mysql-client" if engine == "mysql" else ("libpq" if engine == "postgres"
+                                                        else "sqlite")
+        return False, None, ("客户端缺失：找不到 %s，可 brew install %s（或用 $%s 指定路径）"
+                             % (CLIENT_NAMES[engine], pkg, ENV_CLIENT.get(engine)))
+    if via == "ssh":
+        ssh = shutil.which("ssh")
+        if not ssh:
+            return False, None, "ssh 命令缺失，无法使用 ssh 通道"
+        return True, ssh, None
+    if ":" in str(getattr(resolve_runner, "_target", "") or ""):
+        pass
+    ssh = shutil.which("ssh")
+    docker = shutil.which("docker")
+    return (True, ssh, None) if ssh else (False, None, "ssh 命令缺失，无法使用 docker 通道")
+
+
+# ---------------------------------------------------------------------------
+# 状态文件 / 首次运行初始化
+# ---------------------------------------------------------------------------
+
+def ensure_init():
+    """§1.1 首次运行自动初始化：幂等，绝不覆盖用户已有内容。"""
+    try:
+        os.makedirs(BASE_DIR, exist_ok=True)
+        os.chmod(BASE_DIR, 0o700)
+    except OSError as e:
+        die("STATE_CORRUPT", "无法创建状态目录 %s：%s" % (BASE_DIR, e),
+            "检查家目录是否可写")
+    if os.path.exists(AGENT_FILE):
+        try:
+            os.chmod(AGENT_FILE, 0o644)
+        except OSError:
+            pass
+    else:
+        try:
+            with open(AGENT_FILE, "w", encoding="utf-8") as f:
+                f.write(AGENT_TEMPLATE)
+            os.chmod(AGENT_FILE, 0o644)
+        except OSError as e:
+            warn("写入 %s 失败：%s" % (AGENT_FILE, e))
+    if not os.path.exists(STATE_FILE):
+        _write_state({"version": 1, "databases": {}})
+
+
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {"version": 1, "databases": {}}
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        die("STATE_CORRUPT", "状态文件不可读：%s\n  %s" % (STATE_FILE, e))
+    data = parse_jsonc(text, STATE_FILE)
+    if not isinstance(data, dict):
+        die("STATE_CORRUPT", "状态文件顶层不是对象：%s" % STATE_FILE)
+    data.setdefault("version", 1)
+    if not isinstance(data.get("databases"), dict):
+        die("STATE_CORRUPT", "状态文件缺少 databases 对象：%s" % STATE_FILE)
+    return data
+
+
+def _write_state(state):
+    try:
+        os.makedirs(BASE_DIR, exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, STATE_FILE)
+        os.chmod(STATE_FILE, 0o600)
+        os.chmod(BASE_DIR, 0o700)
+    except OSError as e:
+        die("STATE_CORRUPT", "写入状态文件失败：%s\n  %s" % (STATE_FILE, e))
+
+
+def save_state(state):
+    _write_state(state)
+
+
+# ---------------------------------------------------------------------------
+# 内嵌 AGENT.md（首次运行写入；已存在不覆盖）
+# ---------------------------------------------------------------------------
+
+AGENT_TEMPLATE = """# 数据库（dbbind）
+
+本机用 `dbbind` 管理数据库连接：凭据已经绑定好，AI / 脚本直接用**别名**操作数据库。
+
+## 发现可用数据库
+
+```bash
+dbbind list --json
+```
+
+返回 `{"count":N,"databases":[{"name","engine","host","port","database","file","via",
+"read_only","has_password","origin","config_file","client_found","client_path",
+"usable","usable_reason","warnings"}]}`。
+
+**只使用 `usable: true` 的条目。** `usable_reason` 会写清不可用的原因
+（缺客户端 / 配置缺字段 / `$ENV` 环境变量没设置）。
+
+## 执行 SQL（首选入口）
+
+```bash
+dbbind exec --json <别名> "select ..."            # 结构化输出，推荐
+dbbind exec <别名> "select ..."                   # 人类可读表格
+dbbind exec --json --limit N <别名> "select ..."  # 最多返回 N 行（N 为正整数）
+dbbind exec --json --limit 0 <别名> "select ..."  # 只探测有没有数据：返回 0 行，**不是"不限"**
+```
+
+`--json` 返回
+`{ok,alias,engine,database,sql,columns,rows,row_count,row_count_exact,returned,
+truncated,limit,affected_rows,duration_ms,exit_code,warnings}`。
+
+- `rows` 是**二维数组**，按 `columns` 顺序取值（重名列也不会互相覆盖）。
+- 写语句：`rows` 为 `[]`，`affected_rows` 是受影响行数（拿不到为 `null`）。
+- 默认只返回 `limit` 行（配置 `defaults.limit`，默认 1000），被截断时 `truncated: true`。
+- `row_count` 是**实际读取的行数**：未截断时就是真实总数；截断时等于 `limit+1`，**不代表总数**。
+  只有 `row_count_exact: true` 才能把 `row_count` 当总数用；`false` 表示"至少这么多行，还有更多"。
+- 要全量取数：用 `--out <文件>` 落盘（不传 `--limit` 时不限行数），或显式给一个足够大的 `--limit`。
+
+看结构（都支持 `--json`）：
+
+```bash
+dbbind dbinfo <别名>                  # 版本/当前库/当前用户/编码/库清单
+dbbind databases <别名>               # 库清单
+dbbind tables <别名> [--database DB]  # 表清单
+dbbind columns <别名> <表名>          # 列定义
+dbbind schema <别名>                  # 整库结构：表+列+索引
+```
+
+## 权限：默认只读，DML 与 DDL 分权
+
+| 档位 | 改数据（INSERT/UPDATE/DELETE/REPLACE） | 改结构（DROP/ALTER/CREATE/TRUNCATE…） |
+|---|---|---|
+| 默认 | ❌ 退出码 3 `READONLY_BLOCKED` | ❌ 退出码 3 `READONLY_BLOCKED` |
+| `--write` | ✅ 放行 | ❌ 仍拒绝，退出码 3 `DDL_BLOCKED` |
+| `--unsafe` | ✅ 放行 | ✅ 放行（记 warning） |
+| 别名 `read_only: false` | ✅ | ✅ |
+
+别想着绕过：`/*!50000 DROP*/`、大小写变形、多语句、PRAGMA 写操作都会被拦（宁可误报）。
+
+## 退出码 / 错误
+
+| 码 | 含义 |
+|---|---|
+| 0 | 成功 |
+| 1 | 一般错误（连接失败、SQL 报错、超时） |
+| 2 | 用法错误 |
+| 3 | 被守卫拦截（READONLY_BLOCKED / DDL_BLOCKED） |
+| 4 | 别名不存在 |
+| 5 | 超过策略授权（AUTHZ_DENIED） |
+| 6 | 等待人工审批（APPROVAL_REQUIRED） |
+
+错误对象：`{"ok":false,"error":{"code","message","hint"}}`。
+`code` 稳定取值：`NOT_FOUND` `USAGE` `CONNECT_FAILED` `SQL_ERROR` `READONLY_BLOCKED`
+`DDL_BLOCKED` `CLIENT_MISSING` `STATE_CORRUPT` `TIMEOUT` `UNSUPPORTED`。
+策略闸门还可能返回 `AUTHZ_DENIED` / `APPROVAL_REQUIRED`。
+遇到拒绝停止并报告用户；遇到审批，把 request_id 和 hint 的控制台地址告诉用户，
+等用户批准后原样重试一次。不得自行批准或修改 policy.json/审批单。
+
+`export` 与 `exec` 都检查策略；`--database` 按实际连接库检查。
+DB 审批绑定引擎、默认库和 SQL，跨库相同 SQL 不共用批准。
+Web 控制台：`dbbind --startserver`（默认 127.0.0.1:8791）；临时局域网导入可加
+`--host 0.0.0.0`，首次设置需终端打印的一次性 token，用完关闭。
+
+## 配置从哪来
+
+优先级（低 → 高）：`~/.dbbind/config.json` → 项目 `.dbbind.json`（从当前目录逐级向上
+找第一个）→ `~/.dbbind/databases.json` → `$DBBIND_CONFIG` / `--config`。
+字段级合并，高优先级里**显式出现的字段**才覆盖。
+
+- `origin`：`state`（`dbbind add` 写入）/ `config`（配置文件）/ `merged`（两者都有）。
+- **只存在于配置文件的别名不能被 `dbbind remove` 删除**，要去改配置文件。
+- `dbbind config path` 看生效的文件清单；`dbbind config validate` 校验语法与 `$ENV`。
+
+## 禁止操作
+
+- **禁止** `dbbind add` / `dbbind remove` / `dbbind config init`：改用户状态，属人工操作
+- **禁止** 把密码写进命令行、文件、日志或提交信息
+- **禁止** 手工编辑 `~/.dbbind/databases.json`（由 `dbbind add` 维护）
+- 只在用户明确要求时才用 `dbbind show <别名> --reveal`
+
+## 排错顺序
+
+1. `dbbind doctor` —— 环境、客户端、配置文件、`$ENV` 自检
+2. `dbbind test <别名>` —— 区分「网络/凭据问题」与「SQL 问题」
+3. `dbbind show <别名>` —— 看来源（origin/config_file）与实际连接参数
+4. `usable: false` —— 按 `usable_reason` 处理（装客户端 / 补字段 / 设置环境变量）
+"""
+
+
+# ---------------------------------------------------------------------------
+# SQL 词法小工具（引号/注释感知；只用于解析与守卫，不改变 SQL 语义）
+# ---------------------------------------------------------------------------
+
+def scan_sql(sql, engine="mysql"):
+    """扫描 SQL → (sig_end, statements)。
+
+    sig_end = 最后一个有效字符之后的位置（注释/空白不算）。
+    识别：'...' "..." `...` [...]、-- 注释、/* */ 注释、PG 的 $tag$ 引用。
+    """
+    n = len(sql)
+    i = 0
+    sig_end = 0
+    stmts = []
+    cur_start = None
+    in_sq = in_dq = in_bt = in_br = False
+    line_comment = block_comment = False
+    dollar_tag = None
+    while i < n:
+        ch = sql[i]
+        if line_comment:
+            if ch == "\n":
+                line_comment = False
+            i += 1
+            continue
+        if block_comment:
+            if sql.startswith("*/", i):
+                block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if dollar_tag is not None:
+            if sql.startswith(dollar_tag, i):
+                i += len(dollar_tag)
+                dollar_tag = None
+                sig_end = i
+                continue
+            i += 1
+            continue
+        if in_sq:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                sig_end = i
+                continue
+            if ch == "'":
+                in_sq = False
+            i += 1
+            sig_end = i
+            continue
+        if in_dq:
+            if ch == '"':
+                in_dq = False
+            i += 1
+            sig_end = i
+            continue
+        if in_bt:
+            if ch == "`":
+                in_bt = False
+            i += 1
+            sig_end = i
+            continue
+        if in_br:
+            if ch == "]":
+                in_br = False
+            i += 1
+            sig_end = i
+            continue
+        if sql.startswith("--", i):
+            line_comment = True
+            i += 2
+            continue
+        if engine == "mysql" and ch == "#":
+            line_comment = True
+            i += 1
+            continue
+        if sql.startswith("/*", i):
+            block_comment = True
+            i += 2
+            continue
+        if ch == "'":
+            in_sq = True
+        elif ch == '"':
+            in_dq = True
+        elif ch == "`":
+            in_bt = True
+        elif ch == "[":
+            in_br = True
+        elif ch == "$":
+            m = re.match(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$", sql[i:])
+            if m:
+                dollar_tag = m.group(0)
+                i += len(dollar_tag)
+                sig_end = i
+                continue
+        elif ch == ";":
+            if cur_start is not None:
+                stmts.append((cur_start, i))
+                cur_start = None
+            i += 1
+            sig_end = i
+            continue
+        elif not ch.isspace():
+            if cur_start is None:
+                cur_start = i
+        i += 1
+        sig_end = i
+    if cur_start is not None:
+        stmts.append((cur_start, n))
+    return sig_end, stmts
+
+
+def strip_sql_tail(sql, engine="mysql"):
+    """去掉尾部空白/分号/注释（把用户 SQL 嵌进子查询时必须做）。"""
+    sig_end, _ = scan_sql(sql, engine)
+    body = sql[:sig_end].rstrip()
+    while body.endswith(";"):
+        body = body[:-1].rstrip()
+    return body
+
+
+def count_statements(sql, engine="mysql"):
+    _, stmts = scan_sql(sql, engine)
+    return len([s for s in stmts if sql[s[0]:s[1]].strip()])
+
+
+def first_keyword(sql, engine="mysql"):
+    """忽略前导注释/空白，取第一个关键字（大写）。"""
+    n = len(sql)
+    i = 0
+    while i < n:
+        if sql[i].isspace():
+            i += 1
+            continue
+        if sql.startswith("--", i) or (engine == "mysql" and sql[i] == "#"):
+            j = sql.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        if sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        break
+    m = re.match(r"[A-Za-z_][A-Za-z0-9_$]*", sql[i:])
+    return m.group(0).upper() if m else ""
+
+
+# ---------------------------------------------------------------------------
+# 只读守卫（宁可误报，不可漏报）+ 放行等级（DML / DDL 分权，CONTRACT §4.1）
+# ---------------------------------------------------------------------------
+
+# 只改数据、可回滚的：--write 可以放行
+DML_KEYWORDS = {"INSERT", "UPDATE", "DELETE", "REPLACE", "MERGE"}
+
+# 改结构 / 不可逆 / 能执行任意代码的：--write 挡住，必须 --unsafe
+# 注意：只放**无歧义的独立关键字**。像 INTO / START / COMMENT 这种常见列名的词，
+# 一律走下面的上下文模式（曾经把 `INSERT INTO` 误判成 DDL，等于 --write 对最高频的
+# 写操作失效，还把用户往 --unsafe 引导）。
+DDL_KEYWORDS = {
+    "TRUNCATE", "DROP", "ALTER", "CREATE", "RENAME", "GRANT", "REVOKE", "ATTACH",
+    "DETACH", "VACUUM", "LOCK", "UNLOCK", "COPY", "PRAGMA", "LOAD", "DO",
+    "CALL", "EXECUTE", "PREPARE", "FLUSH", "OPTIMIZE", "REINDEX", "REFRESH",
+    "SHUTDOWN", "INSTALL", "UNINSTALL",
+    # 事务控制：只读场景下不该出现。它们是「先翻转引擎级 read-only 再写」的跳板
+    # （verifier 实测 SET SESSION TRANSACTION READ WRITE; DELETE ... 能绕过安全网），
+    # 按高危处理，要放行只能 --unsafe。
+    "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT",
+}
+WRITE_KEYWORDS = sorted(DML_KEYWORDS | DDL_KEYWORDS)
+
+# 上下文相关的危险形态：不能裸匹配关键字，否则误报（见上）
+_INSERT_INTO_RE = re.compile(r"\b(?:INSERT|REPLACE|MERGE)\s+INTO\b", re.I)
+_TX_FLIP_PATTERNS = [
+    # SELECT ... INTO newtable / INTO OUTFILE / COPY ... INTO（先把 DML 的 INTO 摘掉）
+    (re.compile(r"\bCOPY\b[\s\S]*\bINTO\b", re.I), "COPY INTO"),
+    (re.compile(r"\bSELECT\b[\s\S]*\bINTO\b", re.I), "SELECT INTO"),
+    # START TRANSACTION（用上下文而不是裸 START，免得 select start from ... 被误拦）
+    (re.compile(r"\bSTART\s+TRANSACTION\b", re.I), "START TRANSACTION"),
+    # COMMENT ON TABLE ...（裸 COMMENT 是常见列名）
+    (re.compile(r"\bCOMMENT\s+ON\b", re.I), "COMMENT ON"),
+    # SET [SESSION] TRANSACTION READ WRITE / BEGIN READ WRITE /
+    # SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE
+    (re.compile(r"\bREAD\s+WRITE\b", re.I), "READ WRITE"),
+    # SET ... transaction_read_only = off/false/0/no（MySQL 与 PG 的 sysvar 形式）
+    (re.compile(r"\bSET\b[^;]*\b(?:transaction_read_only|default_transaction_read_only|"
+                r"read_only)\b[^;]*?(?:=|\bTO\b)\s*(?:off|false|0|no)\b", re.I),
+     "SET READ ONLY OFF"),
+]
+CONTEXT_LABELS = frozenset(label for _, label in _TX_FLIP_PATTERNS)
+HIGH_RISK = frozenset(DDL_KEYWORDS | CONTEXT_LABELS)
+
+# 只读 PRAGMA 白名单；不在名单里的一律当写操作（含赋值形式 pragma x=1）
+PRAGMA_READ_OK = {
+    "table_info", "table_xinfo", "table_list", "index_list", "index_info",
+    "index_xinfo", "foreign_key_list", "database_list", "compile_options",
+    "collation_list", "function_list", "module_list", "pragma_list",
+    "integrity_check", "quick_check", "encoding", "page_count", "page_size",
+    "freelist_count", "user_version", "schema_version", "application_id",
+    "auto_vacuum", "journal_mode", "synchronous", "cache_size", "mmap_size",
+    "temp_store", "locking_mode", "max_page_count", "secure_delete",
+    "recursive_triggers", "foreign_keys", "defer_foreign_keys",
+    "read_uncommitted", "query_only", "threads", "data_version", "stats",
+    "busy_timeout", "wal_autocheckpoint", "cell_size_check", "trusted_schema",
+}
+
+_COMMENT_MARK = re.compile(r"/\*!?\d*|\*/|--[^\n]*|#[^\n]*")
+
+
+def flatten_sql(sql, join=False):
+    """去注释标记；join=True 时把内容粘起来，抓 DR/**/OP 这类拆分写法。"""
+    if join:
+        return _COMMENT_MARK.sub("", sql)
+    return re.sub(r"/\*!?\d*|\*/", " ", re.sub(r"--[^\n]*|#[^\n]*", " ", sql))
+
+
+def _pragma_is_write(text):
+    for m in re.finditer(r"\bPRAGMA\b\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?"
+                         r"([A-Za-z_][A-Za-z0-9_]*)?", text, re.I):
+        name = (m.group(1) or "").lower()
+        if not name or name not in PRAGMA_READ_OK:
+            return True
+        seg = text[m.end():m.end() + 80].split(";")[0]
+        if "=" in seg:
+            return True
+    return False
+
+
+def write_hits(sql):
+    """返回命中的写关键字/危险形态（去重、保序）。空列表 = 放行。"""
+    hits = []
+
+    def add(word):
+        if word not in hits:
+            hits.append(word)
+
+    for text in (sql, flatten_sql(sql), flatten_sql(sql, join=True)):
+        if not text:
+            continue
+        for word in WRITE_KEYWORDS:
+            if word == "PRAGMA":
+                continue
+            if re.search(r"\b%s\b" % word, text, re.I):
+                add(word)
+        if re.search(r"\bPRAGMA\b", text, re.I) and _pragma_is_write(text):
+            add("PRAGMA")
+        # 上下文相关的危险形态：先把 DML 的 `INSERT/REPLACE/MERGE INTO` 摘掉再判
+        ctx = _INSERT_INTO_RE.sub(" ", text)
+        for pat, label in _TX_FLIP_PATTERNS:
+            if pat.search(ctx):
+                add(label)
+    return hits
+
+
+def guard_sql(rec, sql, write_ok=False, unsafe=False):
+    """只读守卫。返回要追加的 warnings；拒绝时抛 READONLY_BLOCKED / DDL_BLOCKED(3)。"""
+    hits = write_hits(sql)
+    if not hits:
+        return []
+    alias = rec["name"]
+    if not rec.get("read_only"):
+        return []                                    # 可写别名：建别名时就接受了
+    high = [h for h in hits if h in HIGH_RISK]
+    if unsafe:
+        return ["已用 --unsafe 放行只读守卫（命中：%s）" % "、".join(hits)]
+    if write_ok:
+        if high:
+            die("DDL_BLOCKED",
+                "别名 %s 为只读模式，--write 只放行数据修改，拒绝执行结构变更" % alias,
+                "命中高危形态：%s；确认要改结构请加 --unsafe" % "、".join(high),
+                exit_code=EXIT_READONLY)
+        return ["--write 放行：在只读别名 %s 上执行了数据修改（命中：%s）"
+                % (alias, "、".join(hits))]
+    die("READONLY_BLOCKED",
+        "别名 %s 为只读模式，拒绝执行写操作" % alias,
+        "命中写关键字：%s；确认要写请：dbbind add %s --allow-write --force，"
+        "或单次加 --write（改结构用 --unsafe）" % ("、".join(hits), alias),
+        exit_code=EXIT_READONLY)
+
+
+# ---------------------------------------------------------------------------
+# 标识符 / 字面量安全
+# ---------------------------------------------------------------------------
+
+_BAD_IDENT = re.compile(r"[\s\"'`;\\()\[\]]")
+
+
+def quote_ident(name, engine, what="标识符"):
+    """校验并引用标识符（拒绝注入字符），支持 schema.table。"""
+    if not isinstance(name, str) or not name.strip():
+        die("USAGE", "%s不能为空" % what)
+    out = []
+    for part in name.strip().split("."):
+        if not part or _BAD_IDENT.search(part):
+            die("USAGE", "%s含非法字符：%r" % (what, name),
+                "表名/库名请只用字母数字下划线（点号可表示 schema.table）")
+        out.append("`%s`" % part if engine == "mysql" else '"%s"' % part)
+    return ".".join(out)
+
+
+def sql_str_literal(value, engine):
+    if value is None:
+        return "NULL"
+    s = str(value)
+    if engine == "mysql":
+        s = s.replace("\\", "\\\\")
+    return "'%s'" % s.replace("'", "''")
+
+
+# ---------------------------------------------------------------------------
+# 引擎注册表（加引擎 = 注册一个新 Engine）
+# ---------------------------------------------------------------------------
+
+class Engine(object):
+    def __init__(self, name, client, password_env, default_port, plan, parse):
+        self.name = name
+        self.client = client
+        self.password_env = password_env
+        self.default_port = default_port
+        self.plan = plan          # (rec, sql, kind, allow_write) → (argv_tail, sql_text, mode)
+        self.parse = parse        # (stdout, mode) → (columns, rows, affected, warnings)
+
+
+class Pairs(list):
+    """JSON 对象 → 有序键值对：保列序、重名列不互相覆盖。"""
+
+
+def json_loads_pairs(text):
+    return json.loads(text, object_pairs_hook=Pairs)
+
+
+def plain_value(v):
+    if isinstance(v, Pairs):
+        return dict((k, plain_value(x)) for k, x in v)
+    if isinstance(v, list):
+        return [plain_value(x) for x in v]
+    return v
+
+
+def pairs_to_columns_rows(rows):
+    """[Pairs] → (columns, 二维数组)。"""
+    if not rows:
+        return [], []
+    first = rows[0]
+    if isinstance(first, Pairs):
+        columns = [k for k, _ in first]
+        out = []
+        for row in rows:
+            if isinstance(row, Pairs):
+                if [k for k, _ in row] == columns:
+                    out.append([plain_value(v) for _, v in row])
+                    continue
+                buckets = {}
+                for k, v in row:
+                    buckets.setdefault(k, []).append(v)
+                used, line = {}, []
+                for col in columns:
+                    arr = buckets.get(col, [])
+                    idx = used.get(col, 0)
+                    line.append(plain_value(arr[idx]) if idx < len(arr) else None)
+                    used[col] = idx + 1
+                out.append(line)
+            elif isinstance(row, (list, tuple)):
+                line = [plain_value(v) for v in row]
+                line += [None] * (len(columns) - len(line))
+                out.append(line[:len(columns)])
+            else:
+                out.append([plain_value(row)])
+        return columns, out
+    if isinstance(first, (list, tuple)):
+        width = max(len(r) for r in rows if isinstance(r, (list, tuple)))
+        return (["col%d" % (i + 1) for i in range(width)],
+                [[plain_value(v) for v in r] for r in rows])
+    return ["col1"], [[plain_value(r)] for r in rows]
+
+
+def parse_json_lines(text):
+    """一行一个 JSON 对象的输出 → [结果集]，每个结果集是 [Pairs]。
+
+    适配：sqlite3 -json（[ {..},\\n {..} ]）、PG COPY(row_to_json)（每行一个对象/数组）。
+    """
+    tables, cur = [], []
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            if cur:
+                tables.append(cur)
+                cur = []
+            line = line[1:].strip()
+        if line.endswith("]"):
+            line = line[:-1].strip()
+        if line.endswith(","):
+            line = line[:-1].strip()
+        if not line:
+            continue
+        try:
+            cur.append(json_loads_pairs(line))
+        except ValueError:
+            break                       # 半行（流式提前收手）→ 丢弃
+    if cur:
+        tables.append(cur)
+    return tables
+
+
+_INT_RE = re.compile(r"^(0|-?[1-9][0-9]*)$")
+_FLOAT_RE = re.compile(r"^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?$")
+
+
+def infer_scalar(value):
+    """文本 → 数字，仅在**无损往返**时转换（"007" / "1.50" 保持字符串）。"""
+    if not isinstance(value, str):
+        return value
+    if _INT_RE.match(value):
+        try:
+            iv = int(value)
+        except ValueError:
+            return value
+        if -2 ** 63 <= iv < 2 ** 63 and str(iv) == value:
+            return iv
+        return value
+    if ("." in value or "e" in value or "E" in value) and _FLOAT_RE.match(value):
+        try:
+            fv = float(value)
+        except ValueError:
+            return value
+        if repr(fv) == value or str(fv) == value:
+            return fv
+    return value
+
+
+# ---- MySQL -----------------------------------------------------------------
+#
+# mysql 客户端没有 --json，两条路：
+#  1) 单条 SELECT/WITH/VALUES/TABLE → **JSON 包装**（默认走这条）：
+#       select json_array(`c1`,`c2`) from ( <用户SQL> ) t
+#     列名先用 `select * from (<用户SQL>) t limit 0` + --column-type-info 探一次
+#     （LIMIT 0 不取数据，基本免费）。为什么必须这样：--batch 模式下 SQL NULL 与
+#     字符串字面量 'NULL' 渲染成完全相同的字节（--raw、--null=、--column-type-info
+#     都救不了），只有让 MySQL 自己序列化成 JSON 才能区分 [null, "NULL", ""]。
+#     数字用 parse_float=infer_scalar 解析：DECIMAL 只在无损往返时变 float，
+#     否则保留字符串（1.50 不会变成 1.5）。
+#  2) 派生表不允许重名列、多语句、DML/DDL、SHOW 等 → 退回 `--batch` 的 TSV 路径：
+#     值里的 tab/换行/反斜杠被转义成 \t \n \\，可无损还原（所以**不加 --raw**，
+#     加了反而会破坏行列边界）。这条路上 SQL NULL 与字符串 'NULL' 无法区分，
+#     退回时会记 warning 如实说明。
+# 二进制列在 JSON 路径下会变成 MySQL 的 "base64:typeNNN:..." 形态（可还原，但与
+# TSV 的原始字节形态不同）。batch 模式对 0 行结果不打印表头，探列名那一趟顺带解决。
+
+_MYSQL_UNESCAPE = {"0": "\0", "t": "\t", "n": "\n", "r": "\r", "\\": "\\",
+                   "Z": "\x1a", "b": "\b"}
+
+
+def _mysql_unescape(field):
+    if field == "NULL":
+        return None
+    if "\\" not in field:
+        return field
+    out, i, n = [], 0, len(field)
+    while i < n:
+        ch = field[i]
+        if ch == "\\" and i + 1 < n:
+            out.append(_MYSQL_UNESCAPE.get(field[i + 1], "\\" + field[i + 1]))
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def mysql_json_wrappable(sql):
+    """能不能用 json_array 包起来（单条 SELECT/WITH/VALUES/TABLE）。"""
+    return first_keyword(sql, "mysql") in ("SELECT", "WITH", "VALUES", "TABLE") \
+        and count_statements(sql, "mysql") == 1
+
+
+def mysql_plan(rec, sql, kind, allow_write=False, columns_hint=None, force_tsv=False):
+    argv = ["--batch", "--default-character-set=utf8mb4", "--connect-timeout=10",
+            "-h", str(rec.get("host") or "127.0.0.1"),
+            "-P", str(rec.get("port") or 3306),
+            "-u", str(rec.get("user") or "root")]
+    header_only = kind == "header"
+    if header_only:
+        # 0 行结果时 batch 不打印表头；这个开关强制打印（实测 8.4 / 9.1 均不额外输出元数据）
+        argv.append("--column-type-info")
+    if rec.get("read_only") and not allow_write:
+        argv.append("--init-command=SET SESSION TRANSACTION READ ONLY")
+    if rec.get("database"):
+        argv.append(str(rec["database"]))
+    if header_only:
+        text = "select * from (\n%s\n) t limit 0;\n" % strip_sql_tail(sql, "mysql")
+        return argv, text, "tsv"
+    if kind == "query" and columns_hint and not force_tsv:
+        argv.append("--skip-column-names")       # 列名来自探针，这里不要表头行
+        cols = ", ".join("`%s`" % str(c).replace("`", "``") for c in columns_hint)
+        text = ("select json_array(%s) from (\n%s\n) t;\n"
+                % (cols, strip_sql_tail(sql, "mysql")))
+        return argv, text, "mysql-json"
+    text, mode = sql, "tsv"
+    if kind == "write" and count_statements(sql, "mysql") == 1 \
+            and not re.search(r"\bRETURNING\b", sql, re.I):
+        text = strip_sql_tail(sql, "mysql") + ";\nselect row_count() as dbbind_affected_rows;\n"
+        mode = "tsv-sentinel"
+    return argv, text, mode
+
+
+def _mysql_probe_columns(rec, sql, timeout):
+    """探列名：`select * from (<sql>) t limit 0` + --column-type-info。
+
+    LIMIT 0 不取数据，只是让服务端把结果集列元数据发回来。派生表不允许重名列等
+    情况会失败，调用方据此退回 TSV 路径。
+    """
+    try:
+        argv_tail, text, mode = mysql_plan(rec, sql, "header")
+        argv, env, stdin_text = build_invocation(rec, argv_tail, text)
+        rc, out, err, _, _ = run_proc(argv, env, stdin_text, timeout)
+        if rc != 0:
+            return None
+        cols, _, _, _ = mysql_parse(out, mode)
+        return cols or None
+    except DbbindError:
+        return None
+
+
+def mysql_parse_json_rows(text):
+    """json_array 每行一个 JSON 数组 → 二维数组（DECIMAL 走无损推断）。"""
+    rows = []
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if not line or not line.startswith("["):
+            continue                     # 空行 / 表头 / 杂音
+        if not line.endswith("]"):
+            break                        # 半行（流式被截断）
+        # mysql 客户端在 batch 模式下会把输出里的反斜杠再转义一遍
+        # （JSON 文本 ["a\tb"] 会变成 ["a\\tb"]），先还原再交给 json 解析
+        line = _mysql_unescape(line)
+        if not line:
+            continue
+        try:
+            val = json.loads(line, parse_float=infer_scalar, parse_int=int)
+        except ValueError:
+            break
+        if isinstance(val, list):
+            rows.append([plain_value(v) for v in val])
+    return rows
+
+
+def _parse_tsv_tables(text):
+    """mysql batch 输出 → [(header, rows)]。字段数变化即视为新的结果集表头。
+
+    注意：按 "\\n" 切、只丢掉末尾那个空串。
+      * 不能用 splitlines()：mysql 非 raw 模式不转义裸 \\r，值里的 \\r 会被切开。
+      * 中间的空行不能当噪音丢掉：单列的空字符串值恰好就是一行空行。
+    """
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    tables, header, rows = [], None, []
+    for line in lines:
+        fields = line.split("\t")
+        if header is None:
+            header = fields
+            continue
+        if len(fields) != len(header):
+            tables.append((header, rows))
+            header, rows = fields, []
+            continue
+        rows.append([_mysql_unescape(f) for f in fields])
+    if header is not None:
+        tables.append((header, rows))
+    return tables
+
+
+def mysql_parse(stdout, mode):
+    warnings = []
+    if mode == "mysql-json":
+        return [], mysql_parse_json_rows(stdout), None, warnings
+    tables = _parse_tsv_tables(stdout)
+    affected = None
+    if mode == "tsv-sentinel" and tables:
+        last_header, last_rows = tables[-1]
+        if last_header == ["dbbind_affected_rows"]:
+            tables = tables[:-1]
+            if last_rows and last_rows[0]:
+                val = last_rows[0][0]
+                if isinstance(val, str):
+                    try:
+                        val = int(val)
+                    except ValueError:
+                        val = None
+                if val is not None and val >= 0:
+                    affected = val
+    if len(tables) > 1:
+        warnings.append("检测到多条语句：只返回第一个结果集（其余 %d 个已忽略）"
+                        % (len(tables) - 1))
+    if not tables:
+        return [], [], affected, warnings
+    header, rows = tables[0]
+    if header and header[0] == "dbbind_affected_rows":
+        return [], [], affected, warnings
+    return list(header), [[infer_scalar(v) for v in r] for r in rows], affected, warnings
+
+
+# ---- PostgreSQL ------------------------------------------------------------
+#
+# 读路径：`copy (select row_to_json(t) from (<用户SQL>) t) to stdout`
+#   * 一行一个 JSON 对象 → 可以流式读、limit+1 就收手
+#   * 保留原生类型（bool/json/数字），NULL → JSON null，'' → ""，两者可区分
+#   * 重名列不丢（Pairs 解析）
+# 0 行时 COPY 不输出内容 → 用 `copy (... limit 0)` 的表头行拿列名。
+# EXPLAIN/SHOW 等不能包进子查询的语句，以及写语句，走 psql --csv（表头恒定，
+# 但 psql 的 CSV 无法区分 NULL 与 ''，这两种语句上属已知限制）。
+
+def _pg_wrappable(sql):
+    """能不能安全地包进子查询（SELECT/WITH/VALUES/TABLE 且只有一条语句）。"""
+    kw = first_keyword(sql, "postgres")
+    return kw in ("SELECT", "WITH", "VALUES", "TABLE") \
+        and count_statements(sql, "postgres") == 1
+
+
+def pg_classify(sql):
+    if write_hits(sql):
+        return "write"
+    return "json" if _pg_wrappable(sql) else "csv"
+
+
+def pg_plan(rec, sql, kind, allow_write=False, **_kw):
+    argv = ["-X", "-w", "-v", "ON_ERROR_STOP=1",
+            "-h", str(rec.get("host") or "127.0.0.1"),
+            "-p", str(rec.get("port") or 5432),
+            "-U", str(rec.get("user") or "postgres")]
+    if rec.get("database"):
+        argv += ["-d", str(rec["database"])]
+    # kind: auto/query/write 是执行层的说法，这里翻译成取数方式
+    if kind == "auto":
+        kind = pg_classify(sql)
+    elif kind == "query":
+        kind = "json" if _pg_wrappable(sql) else "csv"
+    elif kind == "write":
+        # 写语句也可能带 RETURNING / CALL 返回行，统一用 --csv 拿结果 + 命令标签
+        kind = "csv"
+    if kind == "json":
+        # 一行一个 JSON 对象，psql -t -A 原样输出：
+        #  * 不用 COPY：COPY 的 text 格式会把反斜杠再转义一遍（数据里的 \ 变 \\，失真）
+        #  * 别名用带空格的引用名：`row_to_json(x)` 里的 x 要是整行引用，若子查询里
+        #    恰好有同名列（比如 select 1 as t）就会解析成那一列（function row_to_json(text)
+        #    does not exist）——带空格的别名用户不可能取到
+        body = strip_sql_tail(sql, "postgres")
+        text = ('select row_to_json("dbbind row") from (\n%s\n) "dbbind row"\n' % body)
+        argv += ["-t", "-A"]
+        return argv, text, "json-lines"
+    if kind in ("csv", "utility"):
+        argv += ["--csv"]
+        return argv, sql, "csv"
+    argv += ["-t", "-A"]
+    return argv, sql, "tags"
+
+
+_PG_TAG_RE = re.compile(
+    r"^(INSERT|UPDATE|DELETE|SELECT|COPY|MERGE|MOVE|FETCH|TRUNCATE TABLE|CREATE TABLE|"
+    r"CREATE INDEX|CREATE VIEW|CREATE SEQUENCE|CREATE SCHEMA|CREATE TYPE|CREATE EXTENSION|"
+    r"CREATE FUNCTION|DROP TABLE|ALTER TABLE|SET|BEGIN|COMMIT|ROLLBACK|GRANT|REVOKE)"
+    r"(\s+\d+)?(\s+\d+)?$")
+
+
+def pg_parse(stdout, mode):
+    warnings = []
+    if mode == "json-lines":
+        tables = parse_json_lines(stdout)
+        if not tables:
+            return [], [], None, warnings
+        columns, rows = pairs_to_columns_rows(tables[0])
+        return columns, rows, None, warnings
+    affected = None
+    keep = []
+    for line in stdout.split("\n"):
+        if "," not in line and _PG_TAG_RE.match(line.strip()):
+            nums = re.findall(r"\d+", line)
+            if len(nums) >= 2:
+                affected = int(nums[-1])
+            keep.append("")
+            continue
+        keep.append(line)
+    text = "\n".join(keep).strip("\n")
+    if mode == "tags" or not text:
+        return [], [], affected, warnings
+    records = [r for r in csv_mod.reader(io.StringIO(text)) if r]
+    if not records:
+        return [], [], affected, warnings
+    columns = records[0]
+    rows = []
+    for rec in records[1:]:
+        if rec and _PG_TAG_RE.match(rec[0] or ""):
+            continue
+        line = [None if v == "" else infer_scalar(v) for v in rec]
+        line += [None] * (len(columns) - len(line))
+        rows.append(line[:len(columns)])
+    return columns, rows, affected, warnings
+
+
+# ---- SQLite ----------------------------------------------------------------
+#
+# `sqlite3 -bail -json`：一行一个 JSON 对象，可流式；NULL → null，'' → ""。
+# 0 行结果 CLI 不打印任何表头（惰性输出）→ 本地文件用标准库 sqlite3 拿列名兜底。
+
+def sqlite_plan(rec, sql, kind, allow_write=False, **_kw):
+    argv = ["-bail", "-json"]
+    if rec.get("read_only") and not allow_write:
+        argv.insert(0, "-readonly")
+    if rec.get("file"):
+        argv.append(str(rec["file"]))
+    text, mode = sql, "json-lines"
+    if kind == "write" and count_statements(sql, "sqlite") == 1 \
+            and not re.search(r"\bRETURNING\b", sql, re.I):
+        text = strip_sql_tail(sql, "sqlite") + ";\nselect changes() as dbbind_affected_rows;\n"
+        mode = "json-sentinel"
+    return argv, text, mode
+
+
+def sqlite_parse(stdout, mode):
+    warnings = []
+    tables = parse_json_lines(stdout)
+    affected = None
+    if mode == "json-sentinel" and tables:
+        last = tables[-1]
+        if last and isinstance(last[0], Pairs) and \
+                [k for k, _ in last[0]] == ["dbbind_affected_rows"]:
+            tables = tables[:-1]
+            val = last[0][0][1]
+            if isinstance(val, int) and val >= 0:
+                affected = val
+    if len(tables) > 1:
+        warnings.append("检测到多条语句：只返回第一个结果集（其余 %d 个已忽略）"
+                        % (len(tables) - 1))
+    if not tables:
+        return [], [], affected, warnings
+    columns, rows = pairs_to_columns_rows(tables[0])
+    return columns, rows, affected, warnings
+
+
+ENGINES = {
+    "mysql": Engine("mysql", "mysql", "MYSQL_PWD", 3306, mysql_plan, mysql_parse),
+    "postgres": Engine("postgres", "psql", "PGPASSWORD", 5432, pg_plan, pg_parse),
+    "sqlite": Engine("sqlite", "sqlite3", None, None, sqlite_plan, sqlite_parse),
+}
+
+
+def engine_of(rec):
+    eng = ENGINES.get(rec.get("engine"))
+    if not eng:
+        die("UNSUPPORTED", "不支持的引擎：%r" % rec.get("engine"),
+            "当前支持：%s" % "、".join(ENGINE_NAMES))
+    return eng
+
+
+# ---------------------------------------------------------------------------
+# 执行通道：local / ssh / docker
+# ---------------------------------------------------------------------------
+
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+            "-o", "StrictHostKeyChecking=accept-new"]
+
+
+def _inside_strings(sql, backslash_escapes):
+    """扫描出「落在引号里或注释里」的字符位置集合（这两处都不可能是客户端元命令）。
+
+    backslash_escapes 用来切换两种转义约定：
+      True  = MySQL 习惯（反斜杠转义引号）
+      False = PG 标准（standard_conforming_strings，反斜杠不转义，'' 才转义）
+    两种结果都算一遍、取交集，解析歧义时宁可误报（见 check_client_metacommands）。
+    """
+    n = len(sql)
+    inside = set()
+    i = 0
+    in_sq = in_dq = in_bt = False
+    line_comment = block_comment = False
+    dollar_tag = None
+    while i < n:
+        ch = sql[i]
+        if line_comment:
+            inside.add(i)
+            if ch == "\n":
+                line_comment = False
+            i += 1
+            continue
+        if block_comment:
+            inside.add(i)
+            if sql.startswith("*/", i):
+                inside.update((i, i + 1))
+                block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if dollar_tag is not None:
+            inside.add(i)
+            if sql.startswith(dollar_tag, i):
+                for k in range(i, min(i + len(dollar_tag), n)):
+                    inside.add(k)
+                i += len(dollar_tag)
+                dollar_tag = None
+                continue
+            i += 1
+            continue
+        if in_sq:
+            inside.add(i)
+            if backslash_escapes and ch == "\\" and i + 1 < n:
+                inside.add(i + 1)
+                i += 2
+                continue
+            if ch == "'":
+                in_sq = False
+            i += 1
+            continue
+        if in_dq:
+            inside.add(i)
+            if ch == '"':
+                in_dq = False
+            i += 1
+            continue
+        if in_bt:
+            inside.add(i)
+            if ch == "`":
+                in_bt = False
+            i += 1
+            continue
+        if sql.startswith("--", i):
+            line_comment = True
+            inside.update((i, i + 1))
+            i += 2
+            continue
+        if sql.startswith("/*", i):
+            block_comment = True
+            inside.update((i, i + 1))
+            i += 2
+            continue
+        if ch == "'":
+            in_sq = True
+            inside.add(i)
+            i += 1
+            continue
+        if ch == '"':
+            in_dq = True
+            inside.add(i)
+            i += 1
+            continue
+        if ch == "`":
+            in_bt = True
+            inside.add(i)
+            i += 1
+            continue
+        if ch == "$":
+            m = re.match(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$", sql[i:])
+            if m:
+                dollar_tag = m.group(0)
+                for k in range(i, min(i + len(dollar_tag), n)):
+                    inside.add(k)
+                i += len(dollar_tag)
+                continue
+        i += 1
+    return inside
+
+
+def check_client_metacommands(sql, engine):
+    """拒绝客户端元命令：psql 的 \\! \\i \\copy \\. / sqlite3 的 .shell .import .output …
+
+    为什么必须在这里挡：元命令**不是 SQL**，根本不经过服务器，所以引擎级只读防线
+    （PGOPTIONS / --init-command / -readonly）和 SQL 关键字守卫都看不见它，
+    而它可以读任意文件、执行任意命令（实测 sqlite3 的 .shell 真能建文件、
+    psql 的 \\! 能把 ~/.dbbind/config.json 的内容塞进结果里回传）。
+    psql 加 -X 也挡不住 -c/stdin 里的 \\!，sqlite3 没有关闭点命令的开关 → 只能输入校验。
+    """
+    # 说明：反斜杠只放行「引号内」和「注释内」——psql 的元命令不可能出现在这两处
+    # （注释里带反斜杠的合法 SQL 不该被误伤；行首 \\ 的检查仍然无条件生效，作为兜底）
+    hint = ("客户端元命令被禁用，请用标准 SQL。psql 的 \\! / \\i / \\copy 与 sqlite3 的 "
+            ".shell / .import / .output 不走服务器，会被当成任意命令执行")
+    for raw in sql.split("\n"):
+        line = raw.lstrip(" \t")
+        if line.startswith("\\"):
+            die("UNSUPPORTED", "客户端元命令被禁用（检测到以反斜杠开头的行：%s）"
+                % line[:40], hint)
+        if engine == "sqlite" and line.startswith("."):
+            die("UNSUPPORTED", "客户端元命令被禁用（检测到以点号开头的行：%s）"
+                % line[:40], hint)
+    if "\\" in sql:
+        lenient = _inside_strings(sql, True)      # MySQL 习惯
+        strict = _inside_strings(sql, False)      # PG 标准
+        for i, ch in enumerate(sql):
+            if ch != "\\":
+                continue
+            if i in lenient and i in strict:
+                continue                          # 两种约定都认为它在字符串里 → 是数据
+            die("UNSUPPORTED",
+                "SQL 里出现字符串外的反斜杠（psql 会把它当元命令执行）",
+                hint)
+
+
+def build_invocation(rec, argv_tail, sql_text, allow_write=False):
+    """把「引擎参数 + SQL」装进执行通道 → (argv, env, stdin_text)。
+
+    密码绝不进 argv：
+      * local  → 环境变量 MYSQL_PWD / PGPASSWORD
+      * ssh    → stdin 首行，由远端 shell read 进环境变量后 exec 客户端
+      * docker → 同上，read 发生在容器内（docker exec -i）
+    """
+    eng = engine_of(rec)
+    via = rec.get("via") or "local"
+    password = rec.get("password") or ""
+    if password and "\n" in password:
+        die("USAGE", "密码包含换行符，无法通过 ssh / docker 通道安全传递",
+            "改用 local 通道，或换一个不含换行的密码")
+    use_password = bool(password) and bool(eng.password_env)
+    env = dict(os.environ)
+    # 校验的是「最终交给客户端的那个字符串」（含我们自己拼的 json/copy 包装）
+    check_client_metacommands(sql_text, eng.name)
+
+    if eng.name == "postgres" and rec.get("read_only") and not allow_write:
+        # §4.2.3 引擎级第二道防线：服务端只读事务
+        env["PGOPTIONS"] = "-c default_transaction_read_only=on"
+
+    if via == "local":
+        client = rec.get("client_path") or find_client(eng.name)[0]
+        if not client:
+            die("CLIENT_MISSING", "找不到 %s 客户端" % CLIENT_NAMES[eng.name],
+                "安装后重试，或用 $%s 指定路径" % ENV_CLIENT[eng.name])
+        if use_password:
+            env[eng.password_env] = password
+        return [client] + argv_tail, env, sql_text
+
+    # 远端：客户端由远端 / 容器内的 PATH 解析 → 用裸名字
+    remote_argv = [CLIENT_NAMES[eng.name]] + argv_tail
+    prelude = ""
+    if use_password:
+        var = "DBBIND_DB_PASSWORD"
+        prelude = ('IFS= read -r %s; export %s; %s="$%s"; export %s; '
+                   % (var, var, eng.password_env, var, eng.password_env))
+    if eng.name == "postgres" and rec.get("read_only") and not allow_write:
+        prelude += "export PGOPTIONS='-c default_transaction_read_only=on'; "
+
+    inner = prelude + "exec " + " ".join(shlex.quote(a) for a in remote_argv)
+    stdin_text = (password + "\n" + sql_text) if use_password else sql_text
+
+    if via == "ssh":
+        return ["ssh"] + SSH_OPTS + [str(rec["via_ssh"]), inner], env, stdin_text
+
+    target = str(rec.get("docker_exec") or "")
+    if not target:
+        die("USAGE", "docker 通道缺少 docker_exec 配置")
+    ssh_alias, _, container = target.partition(":")
+    container = container or ssh_alias
+    docker_argv = ["docker", "exec", "-i", container, "sh", "-c", inner]
+    if ":" in target:
+        remote = " ".join(shlex.quote(a) for a in docker_argv)
+        return ["ssh"] + SSH_OPTS + [ssh_alias, remote], env, stdin_text
+    return docker_argv, env, stdin_text
+
+
+def _drain(stream, sink):
+    try:
+        sink.append(stream.read())
+    except (OSError, ValueError):
+        pass
+
+
+def run_proc(argv, env, stdin_text, timeout, max_lines=None):
+    """执行子进程 → (rc, stdout, stderr, killed_by_limit, timed_out)。
+
+    max_lines 非空时按行流式读取：读够就杀掉子进程，避免大结果集把内存吃光。
+    """
+    if max_lines is None:
+        try:
+            proc = subprocess.run(
+                argv,
+                input=(stdin_text.encode("utf-8") if stdin_text is not None else None),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=(None if stdin_text is not None else subprocess.DEVNULL),
+                env=env, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            die("TIMEOUT", "执行超时（%ss）" % timeout, "加大 --timeout，或把查询拆小")
+        except FileNotFoundError as e:
+            die("CLIENT_MISSING", "找不到可执行文件：%s" % e.filename, "修正 PATH 或安装客户端")
+        except OSError as e:
+            die("CLIENT_MISSING", "无法执行命令：%s" % e, "检查客户端是否可执行")
+        return (proc.returncode, proc.stdout.decode("utf-8", "replace"),
+                proc.stderr.decode("utf-8", "replace"), False, False)
+
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=env)
+    except FileNotFoundError as e:
+        die("CLIENT_MISSING", "找不到可执行文件：%s" % e.filename, "修正 PATH 或安装客户端")
+    except OSError as e:
+        die("CLIENT_MISSING", "无法执行命令：%s" % e, "检查客户端是否可执行")
+
+    err_buf = []
+    th_err = threading.Thread(target=_drain, args=(proc.stderr, err_buf))
+    th_err.daemon = True
+    th_err.start()
+
+    def _feed():
+        try:
+            if stdin_text is not None:
+                proc.stdin.write(stdin_text.encode("utf-8"))
+            proc.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    th_in = threading.Thread(target=_feed)
+    th_in.daemon = True
+    th_in.start()
+
+    state = {"timeout": False}
+
+    def _kill():
+        state["timeout"] = True
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+    timer = threading.Timer(timeout, _kill)
+    timer.daemon = True
+    timer.start()
+    lines, killed = [], False
+    try:
+        for line in proc.stdout:
+            if not line.endswith(b"\n"):
+                break                       # 半行（被 kill 截断）→ 丢弃
+            lines.append(line)
+            if len(lines) >= max_lines:
+                killed = True
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                break
+    finally:
+        timer.cancel()
+        try:
+            proc.stdout.close()
+        except (OSError, ValueError):
+            pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    th_in.join(timeout=5)
+    th_err.join(timeout=5)
+    if state["timeout"]:
+        die("TIMEOUT", "执行超时（%ss）" % timeout, "加大 --timeout，或把查询拆小")
+    out = b"".join(lines).decode("utf-8", "replace")
+    err = b"".join(err_buf).decode("utf-8", "replace")
+    return proc.returncode, out, err, killed, False
+
+
+def first_line(text):
+    for line in (text or "").splitlines():
+        if line.strip():
+            return redact(line.strip())
+    return redact((text or "").strip()) or "未知错误"
+
+
+def classify_db_error(stderr):
+    e = stderr or ""
+    low = e.lower()
+    missing = ("command not found", "executable file not found", "not found in $path",
+               "no such file or directory", "is not recognized as an internal or external")
+    if any(m in low for m in missing):
+        return "CLIENT_MISSING", first_line(e)
+    connect = ("can't connect to mysql server", "unknown mysql server host",
+               "access denied for user", "could not connect to server",
+               "connection refused", "password authentication failed",
+               "no pg_hba.conf entry", "could not translate host name",
+               "connection timed out", "server closed the connection unexpectedly",
+               "is the server running", "network is unreachable", "no route to host",
+               "operation timed out", "unable to open database file",
+               "cannot open shared object file", "no such container",
+               "cannot connect to the docker daemon", "permission denied while trying")
+    if any(m in low for m in connect):
+        return "CONNECT_FAILED", first_line(e)
+    if "permission denied" in low and "publickey" in low:
+        return "CONNECT_FAILED", first_line(e)
+    return "SQL_ERROR", first_line(e)
+
+
+_ERROR_HINTS = {
+    "CONNECT_FAILED": "检查 host/port/凭据；用 dbbind test <别名> 复测",
+    "CLIENT_MISSING": "装客户端，或把别名改成 ssh/docker 通道",
+    "SQL_ERROR": "检查 SQL 语法与对象名（用 dbbind tables/columns 看结构）",
+}
+
+
+# ---------------------------------------------------------------------------
+# 结果集处理：流式读取 + 本地截断（CONTRACT §4.3）
+# ---------------------------------------------------------------------------
+
+def _max_lines_for(mode, kind, limit):
+    """一行=一行的模式才能按行数收手；CSV 有跨行字段，不设行上限。
+
+    limit=None 表示不限；limit=0 表示只读 1 行判断有没有数据。
+    """
+    if kind != "query" or limit is None:
+        return None
+    cap = limit + 1                          # 多读一行，用来判断 truncated
+    if mode in ("tsv", "tsv-sentinel"):
+        return cap + 1                       # 表头 + cap 行
+    if mode in ("mysql-json", "json-lines", "json-sentinel"):
+        return cap
+    return None
+
+
+def _describe_columns(rec, sql, timeout):
+    """0 行结果拿列名的兜底（各引擎能力不同）。"""
+    eng = engine_of(rec)
+    try:
+        if eng.name == "mysql":
+            return _mysql_probe_columns(rec, sql, timeout) or []
+        if eng.name == "postgres":
+            body = strip_sql_tail(sql, "postgres")
+            header_sql = ("copy (select * from (\n%s\n) t limit 0) to stdout "
+                          "with (format csv, header true)\n" % body)
+            argv_tail, text, mode = pg_plan(rec, header_sql, "csv")
+            argv, env, stdin_text = build_invocation(rec, argv_tail, text)
+            rc, out, err, _, _ = run_proc(argv, env, stdin_text, timeout)
+            if rc == 0 and out.strip():
+                first = out.split("\n")[0]
+                return next(csv_mod.reader(io.StringIO(first)))
+        elif eng.name == "sqlite" and rec.get("via") == "local" and rec.get("file"):
+            uri = "file:%s?mode=ro" % quote(os.path.abspath(rec["file"]))
+            con = sqlite_mod.connect(uri, uri=True)
+            try:
+                cur = con.execute(strip_sql_tail(sql, "sqlite"))
+                return [d[0] for d in (cur.description or [])]
+            finally:
+                con.close()
+    except Exception:
+        return []
+    return []
+
+
+def execute_sql(rec, sql, mode="auto", timeout=DEFAULT_TIMEOUT, allow_write=False,
+                limit=None, database=None):
+    """执行 SQL → dict(columns, rows, row_count, truncated, affected_rows, ...)。
+
+    mode: auto=按语句类型选路；query=按读处理；write=按写处理。
+    limit: >0 时本地截断（读到 limit+1 行就收手）；0/None = 不限。
+    """
+    eng = engine_of(rec)
+    rec2 = dict(rec)
+    if database:
+        rec2["database"] = database
+    kind = mode
+    if kind == "auto":
+        kind = "write" if write_hits(sql) else "query"
+    warnings = []
+    # mysql 单条 SELECT：先探一次列名（limit 0，几乎免费），好走 json_array 包装。
+    # 探不到（派生表重名等）就退回 TSV——TSV 那条路无法区分 'NULL' 与 SQL NULL。
+    hint = None
+    if eng.name == "mysql" and kind == "query" and mysql_json_wrappable(sql):
+        hint = _mysql_probe_columns(rec2, sql, timeout)
+    argv_tail, sql_text, plan_mode = eng.plan(rec2, sql, kind, allow_write=allow_write,
+                                              columns_hint=hint)
+    argv, env, stdin_text = build_invocation(rec2, argv_tail, sql_text,
+                                             allow_write=allow_write)
+    max_lines = _max_lines_for(plan_mode, kind, limit)
+    t0 = time.monotonic()
+    rc, out, err, killed, _ = run_proc(argv, env, stdin_text, timeout, max_lines)
+    duration = int((time.monotonic() - t0) * 1000)
+
+    if rc != 0 and not killed and plan_mode == "mysql-json":
+        # JSON 包装在运行期失败（不可 JSON 化的列类型等）→ 用 TSV 再跑一次
+        argv_tail2, sql_text2, plan_mode2 = eng.plan(rec2, sql, kind,
+                                                     allow_write=allow_write,
+                                                     force_tsv=True)
+        argv2, env2, stdin_text2 = build_invocation(rec2, argv_tail2, sql_text2,
+                                                    allow_write=allow_write)
+        rc2, out2, err2, killed2, _ = run_proc(argv2, env2, stdin_text2, timeout,
+                                               _max_lines_for(plan_mode2, kind, limit))
+        if rc2 == 0:
+            warnings.append("该查询退回 TSV 解析（JSON 包装失败：%s）；"
+                            "字符串 'NULL' 可能被当作 NULL" % first_line(err))
+            rc, out, err, killed, plan_mode = rc2, out2, err2, killed2, plan_mode2
+            duration = int((time.monotonic() - t0) * 1000)
+
+    if rc != 0 and not killed:
+        code, message = classify_db_error(err)
+        die(code, message, _ERROR_HINTS.get(code))
+
+    columns, rows, affected, parse_warnings = eng.parse(out, plan_mode)
+    warnings.extend(parse_warnings)
+    if not columns and hint and plan_mode == "mysql-json":
+        columns = list(hint)          # json_array 丢了列名，用探针结果补回
+
+    # 0 行时补列名（mysql/sqlite 的 CLI 不打印空结果表头）
+    if kind == "query" and not rows and not columns and count_statements(sql, eng.name) == 1:
+        columns = _describe_columns(rec2, sql, timeout)
+
+    row_count = len(rows)                    # 实际读取行数（截断时为 limit+1）
+    truncated = bool(limit is not None and row_count > limit)
+    if truncated:
+        rows = rows[:limit]
+    row_count_exact = not truncated
+    return {
+        "columns": columns,
+        "rows": rows,
+        "row_count": row_count,
+        "row_count_exact": row_count_exact,
+        "returned": len(rows),
+        "truncated": truncated,
+        "affected_rows": affected,
+        "warnings": warnings,
+        "duration_ms": duration,
+        "stdout": out,
+        "stderr": redact(err),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 内部只读查询：库 / 表 / 列 / 索引 / 服务器信息
+# ---------------------------------------------------------------------------
+
+def q(sql, rec, database=None, timeout=DEFAULT_TIMEOUT):
+    return execute_sql(rec, sql, mode="query", timeout=timeout, database=database)
+
+
+def list_databases(rec):
+    eng = rec["engine"]
+    if eng == "mysql":
+        res = q("show databases", rec)
+        return [{"name": r[0]} for r in res["rows"]]
+    if eng == "postgres":
+        res = q("select datname from pg_database where not datistemplate order by 1", rec)
+        return [{"name": r[0]} for r in res["rows"]]
+    res = q("pragma database_list", rec)
+    out = []
+    for row in res["rows"]:
+        name = row[1] if len(row) > 1 else row[0]
+        out.append({"name": name, "file": row[2] if len(row) > 2 else None})
+    return out
+
+
+def database_exists(rec, db):
+    """库/schema 是否存在（sqlite 指 attach 进来的 schema 名）。查不了就返回 True，避免误报。"""
+    eng = rec["engine"]
+    try:
+        if eng == "mysql":
+            res = q("select schema_name from information_schema.schemata where schema_name = %s"
+                    % sql_str_literal(db, "mysql"), rec)
+            return bool(res["rows"])
+        if eng == "postgres":
+            res = q("select schema_name from information_schema.schemata where schema_name = %s"
+                    % sql_str_literal(db, "postgres"), rec)
+            return bool(res["rows"])
+        names = set()
+        for r in q("pragma database_list", rec)["rows"]:
+            names.add(r[1] if len(r) > 1 else r[0])
+        return db in names
+    except DbbindError:
+        return True
+
+
+def list_tables(rec, database=None, limit=None):
+    eng = rec["engine"]
+    if eng == "mysql":
+        db = database or rec.get("database")
+        if not db:
+            die("USAGE", "mysql 别名没有默认库，请用 --database 指定",
+                "例如：dbbind tables %s --database appdb" % rec["name"])
+        sql = ("select table_schema as `schema`, table_name as `name`, "
+               "table_type as `type`, table_rows as `rows_estimate`, "
+               "table_comment as `comment` from information_schema.tables "
+               "where table_schema = %s order by table_name"
+               % sql_str_literal(db, "mysql"))
+    elif eng == "postgres":
+        where = "table_schema not in ('pg_catalog','information_schema')"
+        if database:
+            where += " and table_schema = %s" % sql_str_literal(database, "postgres")
+        sql = ("select table_schema as schema, table_name as name, table_type as type, "
+               "null as rows_estimate, null as comment from information_schema.tables "
+               "where %s order by 1,2" % where)
+    else:
+        schema = quote_ident(database or "main", "sqlite", "库名")
+        sql = ("select null as schema, name, type, null as rows_estimate, "
+               "null as comment from %s.sqlite_master "
+               "where type in ('table','view') and name not like 'sqlite_%%' "
+               "order by name" % schema)
+    try:
+        res = q(sql, rec)
+    except DbbindError:
+        # sqlite 用 "<schema>".sqlite_master，schema 不存在时会直接报错
+        if database and not database_exists(rec, database):
+            die("NOT_FOUND", "没有这个库/schema：%s" % database,
+                "用 dbbind databases %s 看有哪些库" % rec["name"])
+        raise
+    cols = res["columns"] or ["schema", "name", "type", "rows_estimate", "comment"]
+    out = []
+    for row in res["rows"]:
+        item = dict(zip(cols, row))
+        if eng == "sqlite":
+            item.pop("schema", None)
+        out.append(item)
+    if limit is not None and limit >= 0:
+        out = out[:limit]
+    if not out and database and not database_exists(rec, database):
+        die("NOT_FOUND", "没有这个库/schema：%s" % database,
+            "用 dbbind databases %s 看有哪些库" % rec["name"])
+    return out, res
+
+
+def list_columns(rec, table, database=None, timeout=DEFAULT_TIMEOUT):
+    eng = rec["engine"]
+    schema, _, bare = table.rpartition(".")
+    bare = bare or table
+    if eng == "mysql":
+        db = database or schema or rec.get("database")
+        if not db:
+            die("USAGE", "mysql 别名没有默认库，请用 --database 指定")
+        sql = ("select column_name as `name`, column_type as `type`, "
+               "is_nullable as `nullable`, column_key as `key`, "
+               "column_default as `default`, extra as `extra` "
+               "from information_schema.columns where table_schema = %s "
+               "and table_name = %s order by ordinal_position"
+               % (sql_str_literal(db, "mysql"), sql_str_literal(bare, "mysql")))
+    elif eng == "postgres":
+        conds = ["table_name = %s" % sql_str_literal(bare, "postgres")]
+        conds.append("table_schema = %s" % sql_str_literal(schema, "postgres") if schema
+                     else "table_schema not in ('pg_catalog','information_schema')")
+        sql = ("select column_name as name, data_type as type, is_nullable as nullable, "
+               "null as key, column_default as default, null as extra "
+               "from information_schema.columns where %s order by ordinal_position"
+               % " and ".join(conds))
+    else:
+        sql = ("select name, type, "
+               "case when \"notnull\" = 0 then 'YES' else 'NO' end as nullable, "
+               "case when pk > 0 then 'PRI' else null end as key, "
+               "dflt_value as \"default\", null as extra "
+               "from pragma_table_info(%s)" % sql_str_literal(bare, "sqlite"))
+    return q(sql, rec, timeout=timeout)
+
+
+def list_indexes(rec, database=None):
+    eng = rec["engine"]
+    if eng == "mysql":
+        db = database or rec.get("database")
+        if not db:
+            return []
+        sql = ("select table_name as `table`, index_name as `name`, "
+               "case when non_unique = 0 then 1 else 0 end as `unique`, "
+               "group_concat(column_name order by seq_in_index) as `columns` "
+               "from information_schema.statistics where table_schema = %s "
+               "group by table_name, index_name, non_unique "
+               "order by table_name, index_name" % sql_str_literal(db, "mysql"))
+    elif eng == "postgres":
+        where = "schemaname not in ('pg_catalog','information_schema')"
+        if database:
+            where += " and schemaname = %s" % sql_str_literal(database, "postgres")
+        sql = ("select tablename as table, indexname as name, null as unique, "
+               "indexdef as columns from pg_indexes where %s "
+               "order by tablename, indexname" % where)
+    else:
+        schema = quote_ident(database or "main", "sqlite", "库名")
+        sql = ("select tbl_name as \"table\", name, null as \"unique\", sql as columns "
+               "from %s.sqlite_master where type = 'index' and name not like 'sqlite_%%' "
+               "order by tbl_name, name" % schema)
+    res = q(sql, rec)
+    cols = res["columns"] or ["table", "name", "unique", "columns"]
+    return [dict(zip(cols, r)) for r in res["rows"]]
+
+
+def dbinfo_data(rec, timeout=DEFAULT_TIMEOUT):
+    eng = rec["engine"]
+    out = {"ok": True, "alias": rec["name"], "engine": eng, "version": None,
+           "current_database": None, "current_user": None, "server_encoding": None,
+           "databases": []}
+    t0 = time.monotonic()
+    if eng == "mysql":
+        # 别名一律加反引号：current_user 之类在 MySQL 9 里是保留字
+        res = q("select version() as `version`, database() as `current_database`, "
+                "current_user() as `current_user`, "
+                "@@character_set_server as `server_encoding`", rec, timeout=timeout)
+        keys = res["columns"] or ["version", "current_database", "current_user",
+                                  "server_encoding"]
+        if res["rows"]:
+            out.update(dict(zip(keys, res["rows"][0])))
+        res2 = q("select table_schema as name, "
+                 "cast(coalesce(sum(data_length + index_length), 0) as signed) as size_bytes, "
+                 "count(*) as table_count from information_schema.tables "
+                 "where table_schema not in ('information_schema','performance_schema','sys') "
+                 "group by table_schema order by table_schema", rec, timeout=timeout)
+        out["databases"] = [{"name": r[0], "size_bytes": r[1], "table_count": r[2]}
+                            for r in res2["rows"]]
+    elif eng == "postgres":
+        res = q("select current_setting('server_version') as version, "
+                "current_database() as current_database, current_user as current_user, "
+                "current_setting('server_encoding') as server_encoding",
+                rec, timeout=timeout)
+        keys = res["columns"] or ["version", "current_database", "current_user",
+                                  "server_encoding"]
+        if res["rows"]:
+            out.update(dict(zip(keys, res["rows"][0])))
+        try:
+            # table_count 只能统计当前库（跨库要 dblink），其余库如实给 null
+            res2 = q("select d.datname as name, pg_database_size(d.datname) as size_bytes, "
+                     "case when d.datname = current_database() then "
+                     " (select count(*) from pg_class c join pg_namespace n "
+                     "  on n.oid = c.relnamespace "
+                     "  where c.relkind in ('r','p','v','m','f') "
+                     "  and n.nspname not in ('pg_catalog','information_schema')) "
+                     "else null end as table_count "
+                     "from pg_database d where not d.datistemplate order by 1",
+                     rec, timeout=timeout)
+        except DbbindError:
+            res2 = q("select datname, null, null from pg_database "
+                     "where not datistemplate order by 1", rec, timeout=timeout)
+        out["databases"] = [{"name": r[0], "size_bytes": r[1], "table_count": r[2]}
+                            for r in res2["rows"]]
+    else:
+        try:
+            res = q("select sqlite_version() as version, 'main' as current_database, "
+                    "null as current_user, 'UTF-8' as server_encoding",
+                    rec, timeout=timeout)
+            keys = res["columns"] or ["version", "current_database", "current_user",
+                                      "server_encoding"]
+            if res["rows"]:
+                out.update(dict(zip(keys, res["rows"][0])))
+        except DbbindError:
+            pass
+        size_bytes = table_count = None
+        try:
+            res2 = q("select (select page_count from pragma_page_count()) * "
+                     "(select page_size from pragma_page_size()) as size_bytes, "
+                     "(select count(*) from sqlite_master where type = 'table' "
+                     " and name not like 'sqlite_%') as table_count", rec, timeout=timeout)
+            if res2["rows"]:
+                size_bytes, table_count = res2["rows"][0][0], res2["rows"][0][1]
+        except DbbindError:
+            pass
+        if size_bytes is None and rec.get("via") == "local" and rec.get("file"):
+            try:
+                size_bytes = os.path.getsize(rec["file"])
+            except OSError:
+                size_bytes = None
+        out["databases"] = [{"name": "main", "size_bytes": size_bytes,
+                             "table_count": table_count}]
+        try:
+            for r in q("pragma database_list", rec, timeout=timeout)["rows"]:
+                name = r[1] if len(r) > 1 else r[0]
+                if name and name != "main":
+                    out["databases"].append({"name": name, "size_bytes": None,
+                                             "table_count": None})
+        except DbbindError:
+            pass
+    out["duration_ms"] = int((time.monotonic() - t0) * 1000)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 别名解析 / 输出条目
+# ---------------------------------------------------------------------------
+
+def current_config(args):
+    return load_effective_config(explicit=getattr(args, "config", None))
+
+
+def get_entry(cfg, name):
+    rec = cfg["entries"].get(name)
+    if not rec:
+        names = sorted(cfg["entries"].keys())
+        hint = "现有别名：%s" % "、".join(names) if names else \
+            "还没有任何别名：写 ~/.dbbind/config.json，或 dbbind add"
+        die("NOT_FOUND", "没有名为 %s 的数据库绑定" % name, hint)
+    return rec
+
+
+def require_usable(rec):
+    if rec.get("usable"):
+        register_secret(rec.get("password"))
+        return rec
+    reason = rec.get("usable_reason") or "配置不完整"
+    code = rec.get("usable_code") or ("CLIENT_MISSING" if reason.startswith("客户端缺失")
+                                      else "USAGE")
+    die(code, "别名 %s 不可用：%s" % (rec["name"], reason),
+        "修好后用 dbbind list --json 复查（origin=%s）" % rec.get("origin"))
+
+
+def public_entry(rec, reveal=False):
+    d = {
+        "name": rec["name"],
+        "engine": rec["engine"],
+        "host": rec.get("host"),
+        "port": rec.get("port"),
+        "user": rec.get("user"),
+        "database": rec.get("database"),
+        "file": rec.get("file"),
+        "via": rec.get("via"),
+        "via_ssh": rec.get("via_ssh"),
+        "docker_exec": rec.get("docker_exec"),
+        "read_only": bool(rec.get("read_only")),
+        "has_password": bool(rec.get("has_password")),
+        "origin": rec.get("origin"),
+        "config_file": rec.get("config_file"),
+        "client_found": bool(rec.get("client_found")),
+        "client_path": rec.get("client_path"),
+        "usable": bool(rec.get("usable")),
+        "usable_reason": rec.get("usable_reason"),
+        "warnings": list(rec.get("warnings") or []),
+    }
+    if reveal:
+        d["password"] = rec.get("password")
+    return d
+
+
+def entry_summary(rec):
+    if rec.get("engine") == "sqlite":
+        return rec.get("file") or "-"
+    return "%s@%s:%s/%s" % (rec.get("user"), rec.get("host"), rec.get("port"),
+                            rec.get("database") or "-")
+
+
+# ---------------------------------------------------------------------------
+# 输出格式化（exec / export 共用）
+# ---------------------------------------------------------------------------
+
+def rows_as_objects(columns, rows):
+    return [dict(zip(columns, r)) for r in rows]
+
+
+def render_table(columns, rows, max_width=48):
+    cols = [str(c) for c in columns]
+    cells = [["NULL" if v is None else str(v) for v in r] for r in rows]
+    widths = [len(c) for c in cols]
+    for r in cells:
+        for i, v in enumerate(r):
+            if i < len(widths):
+                widths[i] = max(widths[i], len(v))
+    widths = [min(w, max_width) for w in widths]
+
+    def cut(s, w):
+        return s if len(s) <= w else s[:max(1, w - 1)] + "…"
+
+    lines = []
+    if cols:
+        lines.append("  " + "  ".join(cut(c, w).ljust(w) for c, w in zip(cols, widths)))
+        lines.append("  " + "  ".join("-" * w for w in widths))
+    for r in cells:
+        lines.append("  " + "  ".join(cut(v, w).ljust(w) for v, w in zip(r, widths)))
+    return "\n".join(lines)
+
+
+def _cell_text(v):
+    if v is None:
+        return ""
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, ensure_ascii=False)
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
+
+
+def format_data(rec, columns, rows, fmt):
+    if fmt == "json":
+        return json.dumps(rows_as_objects(columns, rows), ensure_ascii=False,
+                          indent=2, default=str) + "\n"
+    if fmt == "jsonl":
+        return "".join(json.dumps(o, ensure_ascii=False, default=str) + "\n"
+                       for o in rows_as_objects(columns, rows))
+    if fmt == "csv":
+        buf = io.StringIO()
+        writer = csv_mod.writer(buf, lineterminator="\n")
+        if columns:
+            writer.writerow([_cell_text(c) for c in columns])
+        for r in rows:
+            writer.writerow([_cell_text(v) for v in r])
+        return buf.getvalue()
+    if fmt == "sql":
+        eng = rec.get("engine")
+        lines = ["-- dbbind export（%s）" % rec["name"],
+                 "-- 目标表名请按需替换；字符串已按引擎转义，NULL 写作 NULL"]
+        for r in rows:
+            lines.append("INSERT INTO exported_data (%s) VALUES (%s);"
+                         % (", ".join(str(c) for c in columns),
+                            ", ".join(sql_literal(v, eng) for v in r)))
+        return "\n".join(lines) + "\n"
+    return render_table(columns, rows) + "\n"
+
+
+def sql_literal(v, engine):
+    if v is None:
+        return "NULL"
+    if isinstance(v, bool):
+        if engine == "postgres":
+            return "TRUE" if v else "FALSE"
+        return "1" if v else "0"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    if isinstance(v, (dict, list)):
+        v = json.dumps(v, ensure_ascii=False)
+    s = str(v)
+    if engine == "mysql":
+        s = (s.replace("\\", "\\\\").replace("\0", "\\0").replace("\n", "\\n")
+              .replace("\r", "\\r").replace("\x1a", "\\Z"))
+    return "'%s'" % s.replace("'", "''")
+
+
+def write_out(path, text):
+    target = os.path.abspath(os.path.expanduser(path))
+    d = os.path.dirname(target)
+    if d and not os.path.isdir(d):
+        die("USAGE", "输出目录不存在：%s" % d, "先创建目录，或换一个 --out 路径")
+    try:
+        with open(target, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+    except OSError as e:
+        die("USAGE", "写入失败：%s\n  %s" % (path, e))
+    return target
+
+
+# ---------------------------------------------------------------------------
+# 命令
+# ---------------------------------------------------------------------------
+
+def validate_alias(name):
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name or ""):
+        die("USAGE", "别名只能包含字母、数字、点、下划线、连字符，且不能以符号开头：%s" % name,
+            "例如：demo-mysql、nas_pg")
+
+
+def cmd_add(args):
+    name = args.name
+    validate_alias(name)
+    if args.read_only and args.allow_write:
+        die("USAGE", "--read-only 与 --allow-write 不能同时使用")
+    engine = args.engine
+    if engine not in ENGINE_NAMES:
+        die("USAGE", "不支持的引擎：%s" % engine, "当前支持：%s" % "|".join(ENGINE_NAMES))
+    state = load_state()
+    existed = name in state["databases"]
+    if existed and not args.force:
+        die("USAGE", "别名已存在：%s" % name,
+            "换个名字，或加 --force 覆盖（会替换 databases.json 里的旧记录）")
+
+    warnings = []
+    if engine == "sqlite":
+        if args.password or args.password_stdin:
+            warnings.append("sqlite 不需要密码，已忽略 --password/--password-stdin")
+        if not args.file:
+            die("USAGE", "sqlite 必须用 --file 指定数据库文件")
+        rec = {
+            "name": name, "engine": "sqlite", "host": None, "port": None,
+            "user": None, "password": None, "database": None,
+            "file": os.path.abspath(os.path.expanduser(args.file)),
+            "via_ssh": args.via_ssh, "docker_exec": args.docker_exec,
+            "read_only": not args.allow_write,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "source": "manual", "origin": "state",
+        }
+    else:
+        if not args.host:
+            die("USAGE", "%s 需要 --host" % engine, "例如：--host 192.0.2.10")
+        if not args.user:
+            die("USAGE", "%s 需要 --user" % engine, "例如：--user root")
+        password = None
+        if args.password_stdin:
+            password = sys.stdin.readline().rstrip("\n")
+            if not password:
+                die("USAGE", "从 stdin 读到的密码为空")
+        elif args.password is not None:
+            password = args.password
+            warn("--password 会出现在 shell 历史与 ps 输出里，建议改用 --password-stdin")
+        elif sys.stdin.isatty():
+            try:
+                password = getpass.getpass("  数据库密码（输入时不可见，可留空）: ")
+            except (KeyboardInterrupt, EOFError):
+                print()
+                die("USAGE", "已取消")
+        if args.port:
+            try:
+                port = int(args.port)
+            except (TypeError, ValueError):
+                die("USAGE", "--port 必须是整数：%s" % args.port)
+        else:
+            port = DEFAULT_PORTS[engine]
+        rec = {
+            "name": name, "engine": engine, "host": args.host, "port": port,
+            "user": args.user, "password": password or None,
+            "database": args.database, "file": None,
+            "via_ssh": args.via_ssh, "docker_exec": args.docker_exec,
+            "read_only": not args.allow_write,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "source": "manual", "origin": "state",
+        }
+    register_secret(rec.get("password"))
+    state["databases"][name] = rec
+    save_state(state)
+
+    cfg = load_effective_config(explicit=getattr(args, "config", None))
+    entry = cfg["entries"].get(name)
+    test_result = None
+    if args.test and entry:
+        if not entry.get("usable"):
+            warn("别名不可用：%s" % entry.get("usable_reason"))
+            test_result = {"ok": False, "message": entry.get("usable_reason")}
+        else:
+            try:
+                res = execute_sql(entry, "select 1", mode="query", timeout=30)
+                test_result = {"ok": True, "duration_ms": res["duration_ms"],
+                               "via": entry["via"]}
+            except DbbindError as e:
+                test_result = {"ok": False, "code": e.code, "message": redact(e.message)}
+                warn("连通性测试失败：%s" % redact(e.message))
+    result = {
+        "ok": True, "alias": name, "engine": engine,
+        "via": "docker" if args.docker_exec else ("ssh" if args.via_ssh else "local"),
+        "read_only": rec["read_only"], "has_password": bool(rec.get("password")),
+        "path": STATE_FILE, "replaced": bool(existed),
+        "test": test_result, "warnings": warnings,
+    }
+    if JSON_MODE:
+        emit_json(result)
+    else:
+        human()
+        ok("已绑定 %s（%s，%s）" % (bold(name), engine,
+                                   "只读" if rec["read_only"] else "可写"))
+        info("连接：%s" % entry_summary(entry or rec))
+        if test_result and test_result.get("ok"):
+            ok("连通性测试通过（%sms）" % test_result.get("duration_ms"))
+        for w in warnings:
+            warn(w)
+        human()
+        human("  试试：  dbbind exec %s \"select 1\"" % name)
+        human("  看结构：dbbind tables %s" % name)
+        human()
+    return 0 if (test_result is None or test_result.get("ok")) else EXIT_ERR
+
+
+def cmd_list(args):
+    cfg = current_config(args)
+    want_engine = getattr(args, "engine", None)
+    want_origin = getattr(args, "origin", None)
+    entries = []
+    for name in sorted(cfg["entries"]):
+        rec = cfg["entries"][name]
+        if want_engine and rec.get("engine") != want_engine:
+            continue
+        if want_origin and rec.get("origin") != want_origin:
+            continue
+        item = public_entry(rec)
+        item["warnings"] = list(item.get("warnings") or []) + \
+            _policy_entry_warnings(rec.get("engine"), name)
+        entries.append(item)
+    if JSON_MODE:
+        emit_json({"count": len(entries), "databases": entries,
+                   "config_files": [f["path"] for f in cfg["files"] if f["exists"]]})
+        return 0
+    if not entries:
+        human("还没有配置任何数据库。两种方式：")
+        human("  1) 写配置文件：dbbind config init          （生成模板）")
+        human("  2) 命令行添加：dbbind add mydb --engine mysql --host 1.2.3.4 --user root")
+        return 0
+    head = ("名称", "引擎", "目标", "通道", "来源", "模式", "状态")
+    rows = []
+    for e in entries:
+        target = e["file"] if e["engine"] == "sqlite" else \
+            "%s@%s:%s" % (e["user"], e["host"], e["port"])
+        rows.append([e["name"], e["engine"], target, e["via"], e["origin"],
+                     "只读" if e["read_only"] else "可写",
+                     "可用" if e["usable"] else "不可用:" + (e["usable_reason"] or "")])
+    widths = [max(len(str(r[i])) for r in rows + [head]) for i in range(len(head))]
+    widths[2] = min(widths[2], 44)
+    widths[6] = min(widths[6], 60)
+    human()
+    human("  " + "  ".join(str(h).ljust(widths[i]) for i, h in enumerate(head)))
+    human("  " + "-" * (sum(widths) + 2 * (len(head) - 1)))
+    for r in rows:
+        human("  " + "  ".join(str(c)[:widths[i]].ljust(widths[i])
+                               for i, c in enumerate(r)))
+    human()
+    human("  共 %d 个。详情：dbbind show <别名>；测试：dbbind test" % len(rows))
+    human()
+    return 0
+
+
+def cmd_show(args):
+    cfg = current_config(args)
+    rec = get_entry(cfg, args.name)
+    reveal = bool(getattr(args, "reveal", False))
+    if reveal:
+        register_secret(rec.get("password"))
+    if JSON_MODE:
+        d = public_entry(rec, reveal=reveal)
+        if not reveal:
+            d["password"] = "***" if rec.get("has_password") else None
+        d["created_at"] = rec.get("created_at")
+        d["missing_env"] = rec.get("missing_env")
+        emit_json(d)
+        return 0
+    human()
+    for label, key in (("别名", "name"), ("引擎", "engine"), ("来源", "origin"),
+                       ("配置文件", "config_file"), ("通道", "via"),
+                       ("地址", "host"), ("端口", "port"), ("用户", "user"),
+                       ("默认库", "database"), ("文件", "file"),
+                       ("ssh 别名", "via_ssh"), ("docker", "docker_exec"),
+                       ("只读", "read_only"), ("创建时间", "created_at")):
+        val = rec.get(key)
+        human("  %-10s %s" % (label, val if val is not None else "-"))
+    human("  %-10s %s" % ("密码", rec.get("password") if reveal
+                          else ("***" if rec.get("has_password") else "（无）")))
+    human("  %-10s %s" % ("客户端", rec.get("client_path") or "-"))
+    human("  %-10s %s" % ("可用", "是" if rec.get("usable")
+                          else "否 — %s" % rec.get("usable_reason")))
+    for w in rec.get("warnings") or []:
+        human("  %-10s %s" % ("警告", w))
+    human()
+    human("  执行一条 SQL：dbbind exec %s \"select 1\"" % args.name)
+    human("  查看结构：    dbbind dbinfo %s" % args.name)
+    if rec.get("origin") == "config":
+        human()
+        human("  %s" % (C_DIM + "该别名只存在于配置文件，dbbind remove 删不掉它；请改配置文件" + C_OFF))
+    human()
+    return 0
+
+
+def cmd_test(args):
+    cfg = current_config(args)
+    names = [args.name] if args.name else sorted(cfg["entries"])
+    if not names:
+        die("NOT_FOUND", "还没有配置任何数据库", "先写 ~/.dbbind/config.json 或 dbbind add")
+    results, failed = [], 0
+    for name in names:
+        rec = cfg["entries"].get(name)
+        if not rec:
+            results.append({"name": name, "ok": False, "code": "NOT_FOUND",
+                            "message": "没有这个别名"})
+            failed += 1
+            continue
+        if not rec.get("usable"):
+            failed += 1
+            results.append({"name": name, "engine": rec.get("engine"),
+                            "via": rec.get("via"), "ok": False, "code": "USAGE",
+                            "message": rec.get("usable_reason") or "配置不完整"})
+            if not JSON_MODE:
+                human("  %-18s 跳过  %s" % (name, rec.get("usable_reason")))
+            continue
+        register_secret(rec.get("password"))
+        try:
+            res = execute_sql(rec, "select 1", mode="query", timeout=args.timeout)
+            results.append({"name": name, "engine": rec.get("engine"),
+                            "via": rec.get("via"), "ok": True,
+                            "duration_ms": res["duration_ms"], "message": "OK"})
+            if not JSON_MODE:
+                human("  %-18s 连通  %s  %sms" % (name, rec.get("via"),
+                                                  res["duration_ms"]))
+        except DbbindError as e:
+            failed += 1
+            results.append({"name": name, "engine": rec.get("engine"),
+                            "via": rec.get("via"), "ok": False, "code": e.code,
+                            "message": redact(e.message)})
+            if not JSON_MODE:
+                human("  %-18s 失败  %s" % (name, redact(e.message)))
+    passed = len(results) - failed
+    if JSON_MODE:
+        emit_json({"ok": failed == 0, "count": len(results), "passed": passed,
+                   "failed": failed, "results": results})
+    else:
+        human()
+        human("  %s" % (C_OK + "全部 %d 个连通正常" % len(results) + C_OFF) if not failed
+              else "  %s" % (C_WARN + "%d/%d 不可用" % (failed, len(results)) + C_OFF))
+        human()
+    return 0 if failed == 0 else EXIT_ERR
+
+
+def cmd_remove(args):
+    cfg = current_config(args)
+    rec = get_entry(cfg, args.name)
+    if rec.get("origin") == "config":
+        die("USAGE", "别名 %s 来自配置文件，dbbind remove 不会删除它" % args.name,
+            "请直接编辑配置文件：%s" % (rec.get("config_file") or GLOBAL_CONFIG))
+    state = load_state()
+    if args.name not in state["databases"]:
+        die("NOT_FOUND", "别名 %s 不在 %s 里" % (args.name, STATE_FILE))
+    extra = None
+    if rec.get("origin") == "merged":
+        extra = ("该别名同时来自配置文件 %s；删掉 databases.json 里的记录后，"
+                 "它仍会按配置文件的定义生效" % rec.get("config_file"))
+    if not args.yes:
+        if not sys.stdin.isatty():
+            die("USAGE", "非交互式终端，请加 --yes 确认",
+                "dbbind remove %s --yes" % args.name)
+        human()
+        human("  即将删除绑定 %s（%s）" % (bold(args.name), entry_summary(rec)))
+        human("  " + "-" * 46)
+        human("   · 从 %s 移除该条目" % STATE_FILE)
+        if extra:
+            human("   · %s" % extra)
+        human("   · 不影响数据库服务器上的任何数据")
+        human()
+        try:
+            ans = input("  确认删除？输入 yes 继续: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            ans = ""
+        if ans != "yes":
+            human("  已取消，未做任何改动")
+            return 0
+    state["databases"].pop(args.name, None)
+    save_state(state)
+    result = {"ok": True, "alias": args.name, "removed": True, "path": STATE_FILE}
+    if extra:
+        result["note"] = extra
+    if JSON_MODE:
+        emit_json(result)
+    else:
+        ok("已删除绑定 %s" % args.name)
+        if extra:
+            warn(extra)
+    return 0
+
+
+def resolve_limit(cfg, args, out_path=None):
+    """生效的 limit：None=不限，0=只探测是否有数据，N>0=最多返回 N 行。
+
+    规则（CONTRACT §3.2）：
+      * 显式 --limit N：以它为准；负数报 USAGE
+      * 写 stdout：取配置 defaults.limit（默认 1000，保护 AI 上下文）
+      * 写 --out 文件：默认不限（导出意图就是完整 dump）
+    """
+    limit = getattr(args, "limit", None)
+    if limit is not None:
+        limit = int(limit)
+        if limit < 0:
+            die("USAGE", "--limit 不能是负数：%d" % limit,
+                "0 = 只探测有没有数据；要全量请写 --out（落盘默认不限）")
+        return limit
+    if out_path:
+        return None
+    try:
+        return int(cfg["defaults"].get("limit", DEFAULT_LIMIT))
+    except (TypeError, ValueError):
+        return DEFAULT_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# bindconsole：策略闸门 + 本机 Web 控制台（CONTRACT bindconsole §3/§4/§8）
+# ---------------------------------------------------------------------------
+
+BINDCONSOLE_INSTALL_CMD = "curl -fsSL https://github.com/isle24/bindkit/releases/latest/download/install.sh | bash"
+_POLICY_MODULE = None
+
+
+def bindconsole_home():
+    return (os.environ.get("BINDCONSOLE_HOME")
+            or os.path.join(os.path.expanduser("~"), ".bindconsole"))
+
+
+def bindconsole_lib():
+    return os.path.join(bindconsole_home(), "lib")
+
+
+def load_policy_module(required=False):
+    """从 ~/.bindconsole/lib 加载策略模块（单一真源）。
+
+    未安装 → exec 闸门 fail-open（契约 §1：无策略文件=维持原行为），
+    但 --startserver 必须报明确错误并给安装命令。
+    """
+    global _POLICY_MODULE
+    if _POLICY_MODULE is not None:
+        return _POLICY_MODULE
+    lib = bindconsole_lib()
+    if os.path.isdir(lib) and lib not in sys.path:
+        sys.path.insert(0, lib)
+    try:
+        import bindkit_policy as mod
+        _POLICY_MODULE = mod
+        return mod
+    except Exception as e:                     # noqa: BLE001
+        if required:
+            die("UNSUPPORTED", "找不到 bindconsole 内核：%s（%s）" % (lib, e),
+                "先安装：%s" % BINDCONSOLE_INSTALL_CMD)
+        # CONTRACT §8.1.1 的 fail-closed 边界（显式写在这里，别改成一律放行）：
+        #   * policy.json 不存在  + 模块缺失 → allow（用户本就没设限，保持兼容）
+        #   * policy.json 存在    + 模块缺失 → deny STATE_CORRUPT（否则已配的限制形同虚设）
+        policy_path = os.path.join(os.path.expanduser("~"), ".dbbind", "policy.json")
+        if os.path.exists(policy_path):
+            exc = DbbindError(
+                "STATE_CORRUPT",
+                "策略文件存在但 bindconsole 内核缺失/无法加载，已按 fail-closed 拒绝",
+                "重新安装内核：%s（加载错误：%s）" % (BINDCONSOLE_INSTALL_CMD, e))
+            exc.gate_error = True
+            raise exc
+        return None
+
+
+def _policy_gate_db(rec, sql, requested_write, requested_unsafe):
+    """调策略闸门。返回 None（无策略模块/无策略文件 → 放行且零副作用）或闸门 dict。"""
+    mod = load_policy_module()
+    if mod is None:
+        return None
+    try:
+        return mod.gate_db(rec["name"], sql, rec.get("engine") or "mysql",
+                           rec.get("database") if rec.get("engine") != "sqlite"
+                           else None,
+                           requested_write=requested_write,
+                           requested_unsafe=requested_unsafe, requester="ai")
+    except Exception:                          # noqa: BLE001 —— 闸门绝不抛给主流程
+        return {"decision": "deny", "code": "AUTHZ_DENIED",
+                "message": "策略校验内部错误，已按 fail-closed 拒绝",
+                "hint": "查看 ~/.bindconsole/audit.log"}
+
+
+def _policy_entry_warnings(engine, name):
+    """从策略里取「易用性提示」（不阻断执行），例如 PG schema 未收口的提醒。"""
+    mod = load_policy_module()
+    if mod is None:
+        return []
+    try:
+        pol = mod.read_policy("db")
+        if not pol.get("exists") or pol.get("corrupt"):
+            return []
+        eff = mod.effective_db_policy(pol.get("data") or {}, name)
+        return list(mod.policy_warnings(engine, eff))
+    except Exception:                          # noqa: BLE001 —— 提示失败不影响主流程
+        return []
+
+
+def _raise_gate(gate):
+    """把闸门结果转成 DbbindError（带 request_id/expires_at 额外字段）。"""
+    code = gate.get("code") or "AUTHZ_DENIED"
+    exc = DbbindError(code, gate.get("message") or "授权校验未通过",
+                      gate.get("hint"), CODE_EXIT.get(code, EXIT_ERR))
+    exc.gate_error = True
+    extra = {}
+    if gate.get("request_id"):
+        extra["request_id"] = gate["request_id"]
+    if gate.get("expires_at"):
+        extra["expires_at"] = gate["expires_at"]
+    exc.extra = extra
+    return exc
+
+
+# ---- 控制台 handlers（内核只做 HTTP/认证/CSRF，这里操作工具真实状态）-----------
+
+_CONSOLE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+# 业务错误码 → HTTP 状态（内核会把 ConsoleError.status 原样映射）
+_CONSOLE_STATUS = {"NOT_FOUND": 404, "CONFLICT": 409, "ALREADY_EXISTS": 409,
+                   "INVALID_REQUEST": 400, "INVALID_PARAM": 400}
+
+
+def _console_fail(message, code="INVALID_REQUEST", hint=None):
+    """抛给内核的四类错误：优先用内核的 ConsoleError（带精确 4xx），否则 ValueError。"""
+    status = _CONSOLE_STATUS.get(code, 400)
+    try:
+        from bindkit_console import ConsoleError
+        return ConsoleError(code, message, hint, status=status)
+    except Exception:                          # noqa: BLE001
+        return ValueError(message)
+
+
+def _console_validate_name(name):
+    name = str(name or "").strip()
+    if not _CONSOLE_NAME_RE.match(name) or ".." in name:
+        raise _console_fail("别名不合法（只允许字母数字._-，且不能以符号开头）")
+    return name
+
+
+def _console_policy_module():
+    mod = load_policy_module()
+    if mod is None:
+        raise _console_fail("bindconsole 内核未安装，无法读写策略", "INTERNAL",
+                            "先执行：%s" % BINDCONSOLE_INSTALL_CMD)
+    return mod
+
+
+def _console_db_policy_map(mod):
+    pol = mod.read_policy("db")
+    return (pol.get("data") or {}) if pol.get("exists") and not pol.get("corrupt") else {}
+
+
+def _console_db_item(name, rec, mod):
+    e = public_entry(rec)
+    eff = mod.effective_db_policy(_console_db_policy_map(mod), name) if mod else None
+    return {
+        "alias": name,
+        "engine": e["engine"],
+        "host": e["host"],
+        "port": e["port"],
+        "user": e["user"],
+        "database": e["database"],
+        "file": e["file"],
+        "via": e["via"],
+        "via_ssh": e["via_ssh"],
+        "docker_exec": e["docker_exec"],
+        "origin": e["origin"],
+        "usable": e["usable"],
+        "usable_reason": e["usable_reason"],
+        "has_password": e["has_password"],
+        "read_only": e["read_only"],
+        "max_level": eff["max_level"] if eff else "read",
+        "allowed_databases": eff["allowed_databases"] if eff else None,
+        "allowed_tables": eff["allowed_tables"] if eff else None,
+        "allowed_schemas": eff["allowed_schemas"] if eff else None,
+        "allow_metadata": eff["allow_metadata"] if eff else True,
+        "approval": eff["approval"] if eff else {"write": False, "ddl": True},
+        "warnings": list(e["warnings"] or []) +
+                    _policy_entry_warnings(e["engine"], name),
+    }
+
+
+def console_db_list():
+    cfg = load_effective_config()
+    mod = load_policy_module()
+    return {"items": [_console_db_item(n, cfg["entries"][n], mod)
+                      for n in sorted(cfg["entries"])]}
+
+
+def console_db_get(name):
+    name = _console_validate_name(name)
+    cfg = load_effective_config()
+    if name not in cfg["entries"]:
+        raise _console_fail("没有这个别名：%s" % name, "NOT_FOUND")
+    return _console_db_item(name, cfg["entries"][name], load_policy_module())
+
+
+def console_db_create(body):
+    if not isinstance(body, dict):
+        raise _console_fail("请求体必须是 JSON 对象")
+    name = _console_validate_name(body.get("alias") or body.get("name"))
+    engine = str(body.get("engine") or "").strip().lower()
+    if engine not in ENGINE_NAMES:
+        raise _console_fail("engine 必须是 mysql/postgres/sqlite")
+    state = load_state()
+    if name in state["databases"]:
+        raise _console_fail("别名已存在：%s" % name, "CONFLICT")
+    # 配置文件里的别名也算已存在（控制台不该静默遮蔽它）
+    if name in load_effective_config()["entries"]:
+        raise _console_fail("别名已存在（来自配置文件）：%s" % name, "CONFLICT")
+    policy_entry = _console_clean_policy_entry(body)
+    now = datetime.now().isoformat(timespec="seconds")
+    rec = {"name": name, "engine": engine,
+           "host": None, "port": None, "user": None, "password": None,
+           "database": None, "file": None, "via_ssh": None, "docker_exec": None,
+           "read_only": True, "created_at": now, "source": "console", "origin": "state"}
+    if body.get("read_only") is False or body.get("allow_write") is True:
+        rec["read_only"] = False
+    if engine == "sqlite":
+        path = str(body.get("file") or "").strip()
+        if not path:
+            raise _console_fail("sqlite 必须提供 file")
+        rec["file"] = os.path.abspath(os.path.expanduser(path))
+    else:
+        host = str(body.get("host") or "").strip()
+        user = str(body.get("user") or "").strip()
+        if not host:
+            raise _console_fail("%s 必须提供 host" % engine)
+        if not user:
+            raise _console_fail("%s 必须提供 user" % engine)
+        rec["host"] = host
+        rec["user"] = user
+        port = body.get("port")
+        try:
+            rec["port"] = int(port) if port not in (None, "") else DEFAULT_PORTS[engine]
+        except (TypeError, ValueError):
+            raise _console_fail("port 必须是整数")
+        rec["database"] = str(body.get("database") or "").strip() or None
+        password = body.get("password")
+        if isinstance(password, str) and password != "":
+            rec["password"] = password
+    for opt in ("via_ssh", "docker_exec"):
+        val = body.get(opt)
+        if isinstance(val, str) and val.strip():
+            rec[opt] = val.strip()
+    register_secret(rec.get("password"))
+    # 先校验并保存授权，再登记连接；策略写失败时不能留下不受限的新别名。
+    if policy_entry:
+        _console_policy_put({"databases": {name: policy_entry}})
+    state["databases"][name] = rec
+    save_state(state)
+    return {"ok": True, "alias": name, "engine": engine}
+
+
+def console_db_update(name, body):
+    name = _console_validate_name(name)
+    if not isinstance(body, dict):
+        raise _console_fail("请求体必须是 JSON 对象")
+    state = load_state()
+    changed = []
+    policy_keys = ("max_level", "allowed_databases", "allowed_tables",
+                   "allowed_schemas", "allow_metadata", "approval", "approval_ttl_s")
+    policy_entry = _console_clean_policy_entry({k: body[k] for k in policy_keys if k in body})
+    if name in state["databases"]:
+        rec = state["databases"][name]
+        if rec.get("engine") == "sqlite" and isinstance(body.get("file"), str) \
+                and body["file"].strip():
+            rec["file"] = os.path.abspath(os.path.expanduser(body["file"].strip()))
+            changed.append("file")
+        for key in ("host", "user", "database", "via_ssh", "docker_exec"):
+            if key in body and body[key] is not None:
+                val = body[key]
+                val = val.strip() if isinstance(val, str) else val
+                if val != "":                 # 留空 = 不改
+                    rec[key] = val
+                    changed.append(key)
+        if "port" in body and body["port"] not in (None, ""):
+            try:
+                rec["port"] = int(body["port"])
+                changed.append("port")
+            except (TypeError, ValueError):
+                raise _console_fail("port 必须是整数")
+        if "read_only" in body and body["read_only"] is not None:
+            rec["read_only"] = bool(body["read_only"])
+            changed.append("read_only")
+        if isinstance(body.get("password"), str) and body["password"] != "":
+            rec["password"] = body["password"]
+            register_secret(rec["password"])
+            changed.append("password")
+        if changed:
+            state["databases"][name] = rec
+    else:
+        cfg = load_effective_config()
+        if name not in cfg["entries"]:
+            raise _console_fail("没有这个别名：%s" % name, "NOT_FOUND")
+        if any(k in body and body[k] not in (None, "")
+               for k in ("host", "user", "database", "port", "password", "file",
+                          "via_ssh", "docker_exec", "read_only")):
+            raise _console_fail("别名 %s 来自配置文件，不能在控制台改连接参数"
+                                "（请编辑配置文件；策略字段仍可改）" % name, "CONFLICT")
+    # 策略字段（任何别名都可改）
+    if policy_entry:
+        _console_policy_put({"databases": {name: policy_entry}})
+    if changed:
+        save_state(state)
+    return {"ok": True, "alias": name, "changed": changed}
+
+
+def console_db_delete(name, body=None):
+    name = _console_validate_name(name)
+    state = load_state()
+    if name not in state["databases"]:
+        cfg = load_effective_config()
+        if name in cfg["entries"]:
+            raise _console_fail("别名 %s 来自配置文件，控制台删不掉它；"
+                                "请直接编辑配置文件" % name, "CONFLICT")
+        raise _console_fail("没有这个别名：%s" % name, "NOT_FOUND")
+    state["databases"].pop(name, None)
+    save_state(state)
+    return {"ok": True, "deleted": name}
+
+
+def console_db_test(name):
+    name = _console_validate_name(name)
+    cfg = load_effective_config()
+    rec = cfg["entries"].get(name)
+    if not rec:
+        raise _console_fail("没有这个别名：%s" % name, "NOT_FOUND")
+    if not rec.get("usable"):
+        return {"ok": False, "usable": False,
+                "message": rec.get("usable_reason") or "不可用"}
+    register_secret(rec.get("password"))
+    try:
+        res = execute_sql(rec, "select 1", mode="query", timeout=15)
+        return {"ok": True, "usable": True, "duration_ms": res["duration_ms"],
+                "via": rec.get("via")}
+    except DbbindError as e:
+        return {"ok": False, "usable": False, "message": redact(e.message)}
+
+
+def _console_sanitize_db_policy(payload):
+    """校验/规范化 db 策略，返回可写入的新策略 dict。"""
+    if not isinstance(payload, dict):
+        raise _console_fail("策略必须是 JSON 对象")
+    out = {"version": 1, "defaults": {}, "databases": {}}
+    defaults = payload.get("defaults") if isinstance(payload.get("defaults"), dict) else {}
+    out["defaults"] = _console_clean_policy_entry(defaults, is_defaults=True)
+    dbs = payload.get("databases") if isinstance(payload.get("databases"), dict) else {}
+    for alias, entry in dbs.items():
+        if not _CONSOLE_NAME_RE.match(str(alias or "")) or ".." in str(alias):
+            raise _console_fail("策略里的别名不合法：%r" % (alias,))
+        if not isinstance(entry, dict):
+            raise _console_fail("别名 %s 的策略必须是对象" % alias)
+        out["databases"][str(alias)] = _console_clean_policy_entry(entry)
+    return out
+
+
+def _console_clean_policy_entry(entry, is_defaults=False):
+    clean = {}
+    if "max_level" in entry:
+        level = str(entry.get("max_level") or "").lower()
+        if level not in LEVELS_FOR_POLICY:
+            raise _console_fail("max_level 必须是 read/write/ddl：%r" % entry.get("max_level"))
+        clean["max_level"] = level
+    if "approval" in entry:
+        approval = entry.get("approval")
+        if not isinstance(approval, dict):
+            raise _console_fail("approval 必须是对象，如 {\"write\": true, \"ddl\": true}")
+        clean["approval"] = {k: bool(approval.get(k, False)) for k in ("write", "ddl")
+                             if k in approval}
+    if "allowed_databases" in entry:
+        val = entry["allowed_databases"]
+        if val is None:
+            clean["allowed_databases"] = None
+        elif isinstance(val, list):
+            clean["allowed_databases"] = [str(x).strip() for x in val if str(x).strip()]
+        else:
+            raise _console_fail("allowed_databases 必须是 null 或字符串数组")
+    if "allowed_tables" in entry:
+        val = entry["allowed_tables"]
+        if val is None:
+            clean["allowed_tables"] = None
+        elif isinstance(val, list):
+            clean["allowed_tables"] = [str(x).strip() for x in val if str(x).strip()]
+        else:
+            raise _console_fail("allowed_tables 必须是 null 或字符串数组")
+    if "allowed_schemas" in entry:
+        val = entry["allowed_schemas"]
+        if val is None:
+            clean["allowed_schemas"] = None
+        elif isinstance(val, list):
+            clean["allowed_schemas"] = [str(x).strip() for x in val if str(x).strip()]
+        else:
+            raise _console_fail("allowed_schemas 必须是 null 或字符串数组")
+    if "allow_metadata" in entry:
+        clean["allow_metadata"] = bool(entry["allow_metadata"])
+    if "approval_ttl_s" in entry:
+        try:
+            ttl = int(entry["approval_ttl_s"])
+        except (TypeError, ValueError):
+            raise _console_fail("approval_ttl_s 必须是整数")
+        clean["approval_ttl_s"] = max(60, min(86400, ttl))
+    return clean
+
+
+LEVELS_FOR_POLICY = ("read", "write", "ddl")
+
+
+def _console_policy_put(body):
+    mod = _console_policy_module()
+    current = mod.read_policy("db")
+    base = (current.get("data") or {}) if current.get("exists") and not current.get("corrupt") \
+        else mod.default_policy("db")
+    merged = json.loads(json.dumps(base))
+    merged.setdefault("defaults", {})
+    merged.setdefault("databases", {})
+    if isinstance(body, dict) and isinstance(body.get("defaults"), dict):
+        merged["defaults"].update(body["defaults"])
+    if isinstance(body, dict) and isinstance(body.get("databases"), dict):
+        for alias, entry in body["databases"].items():
+            if alias not in merged["databases"] or not isinstance(merged["databases"][alias], dict):
+                merged["databases"][alias] = {}
+            merged["databases"][alias].update(entry or {})
+    # 整体也允许直接 PUT 完整策略（有 version/defaults/databases 三键之一即可）
+    if isinstance(body, dict) and ("defaults" in body or "databases" in body):
+        clean = _console_sanitize_db_policy(merged)
+        mod.write_policy("db", clean)
+        return {"ok": True, "path": mod.tool_paths("db")["policy"]}
+    raise _console_fail("策略请求体需要包含 defaults 或 databases")
+
+
+def console_db_policy_get():
+    mod = _console_policy_module()
+    summary = mod.policy_summary("db")
+    summary["effective"] = {
+        alias: mod.effective_db_policy(summary.get("policy") or {}, alias)
+        for alias in list((summary.get("policy") or {}).get("databases", {}))
+    }
+    return summary
+
+
+def console_db_policy_put(body):
+    return _console_policy_put(body)
+
+
+def build_console_handlers():
+    """给 bindkit_console.run_console 的 handlers（CONTRACT §7.1.1 冻结形状）。"""
+    return {
+        "resource": "databases",
+        "list": console_db_list,
+        "get": console_db_get,
+        "create": console_db_create,
+        "update": console_db_update,
+        "delete": console_db_delete,
+        "test": console_db_test,
+        "policy_get": console_db_policy_get,
+        "policy_put": console_db_policy_put,
+    }
+
+
+# ---- --startserver ---------------------------------------------------------
+
+DEFAULT_CONSOLE_PORT = 8791          # dbbind 控制台默认端口（sshbind 是 8790）
+
+
+def _parse_startserver_args(argv):
+    """只解析 --startserver 及其参数；与其他子命令互斥（CONTRACT §2）。"""
+    port = DEFAULT_CONSOLE_PORT
+    host = "127.0.0.1"
+    daemon = open_browser = False
+    saw = False
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--startserver":
+            saw = True
+        elif a == "--daemon":
+            daemon = True
+        elif a in ("--open", "--open-browser"):
+            open_browser = True
+        elif a == "--port":
+            i += 1
+            if i >= len(argv):
+                die("USAGE", "--port 需要一个端口号")
+            try:
+                port = int(argv[i])
+            except (TypeError, ValueError):
+                die("USAGE", "--port 必须是整数：%r" % argv[i])
+        elif a.startswith("--port="):
+            try:
+                port = int(a.split("=", 1)[1])
+            except (TypeError, ValueError):
+                die("USAGE", "--port 必须是整数：%r" % a)
+        elif a == "--host":
+            i += 1
+            if i >= len(argv):
+                die("USAGE", "--host 需要一个地址（默认 127.0.0.1；局域网用 0.0.0.0）")
+            host = argv[i]
+        elif a.startswith("--host="):
+            host = a.split("=", 1)[1]
+        elif a in ("-h", "--help"):
+            rest.append(a)
+        else:
+            rest.append(a)
+        i += 1
+    if rest:
+        die("USAGE", "--startserver 与其他子命令/参数互斥：%s" % " ".join(rest),
+            "用法：dbbind --startserver [--port 8791] [--host 127.0.0.1] "
+            "[--daemon] [--open]")
+    if not saw:
+        die("USAGE", "内部错误：未检测到 --startserver")
+    if not (1 <= port <= 65535):
+        die("USAGE", "端口超出范围：%d" % port)
+    return port, host, daemon, open_browser
+
+
+def start_console_mode(argv):
+    """--startserver 分支：加载内核 → 传入 handlers → 前台/后台运行。"""
+    port, host, daemon, open_browser = _parse_startserver_args(argv)
+    lib = bindconsole_lib()
+    if not os.path.isfile(os.path.join(lib, "bindkit_console.py")):
+        sys.stderr.write(
+            "ERROR 找不到 bindconsole 内核：%s\n"
+            "      先安装：%s\n" % (os.path.join(lib, "bindkit_console.py"),
+                                   BINDCONSOLE_INSTALL_CMD))
+        return EXIT_ERR
+    if lib not in sys.path:
+        sys.path.insert(0, lib)
+    try:
+        from bindkit_console import run_console
+    except Exception as e:                     # noqa: BLE001
+        sys.stderr.write("ERROR 加载 bindconsole 内核失败：%s\n"
+                         "      重新安装：%s\n" % (e, BINDCONSOLE_INSTALL_CMD))
+        return EXIT_ERR
+    os.environ.setdefault("BINDCONSOLE_HOME", bindconsole_home())
+    try:
+        rc = run_console("db", port=port, handlers=build_console_handlers(),
+                         daemon=daemon, open_browser=open_browser, host=host)
+    except TypeError:
+        # 老内核没有 host 参数：回环模式退化成旧签名，非回环明确报错
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            sys.stderr.write("ERROR 当前 bindconsole 内核不支持 --host（需要重新安装）：%s\n"
+                             "      重新安装：%s\n" % (host, BINDCONSOLE_INSTALL_CMD))
+            return EXIT_ERR
+        rc = run_console("db", port, build_console_handlers(),
+                         daemon=daemon, open_browser=open_browser)
+    return EXIT_OK if rc is None else int(rc)
+
+
+
+
+def cmd_exec(args):
+    cfg = current_config(args)
+    rec = require_usable(get_entry(cfg, args.name))
+    sql = args.sql
+    if not sql or not sql.strip():
+        die("USAGE", "请给出要执行的 SQL", 'dbbind exec %s "select 1"' % args.name)
+    # 客户端元命令先挡（契约 §4.2.1b）：它不是 SQL，走引擎级防线和关键字守卫都看不见
+    check_client_metacommands(sql, rec["engine"])
+    write_ok = bool(args.write or args.unsafe)
+    # bindconsole 策略闸门（先策略、后原只读守卫；策略上限优先于 --write/--unsafe）
+    policy_rec = dict(rec, database=args.database or rec.get("database"))
+    gate = _policy_gate_db(policy_rec, sql, write_ok, bool(args.unsafe))
+    gate_warnings = list(gate.get("warnings") or []) if gate else []
+    if gate and gate.get("decision") in ("deny", "ask"):
+        raise _raise_gate(gate)
+    warnings = gate_warnings + guard_sql(rec, sql, write_ok=write_ok,
+                                         unsafe=bool(args.unsafe))
+    out_path = getattr(args, "out", None)
+    limit = resolve_limit(cfg, args, out_path)
+    res = execute_sql(rec, sql, mode="auto", timeout=args.timeout,
+                      allow_write=write_ok, limit=limit, database=args.database)
+    warnings.extend(res["warnings"])
+    if res["truncated"] and out_path:
+        warnings.append("落盘内容被 --limit %d 截断；要全量导出请去掉 --limit（落盘默认不限）"
+                        % limit)
+    envelope = {
+        "ok": True,
+        "alias": rec["name"],
+        "engine": rec["engine"],
+        "database": args.database or rec.get("database"),
+        "sql": redact(sql),
+        "columns": res["columns"],
+        "rows": res["rows"],
+        "row_count": res["row_count"],
+        "row_count_exact": bool(res["row_count_exact"]),
+        "returned": res["returned"],
+        "truncated": bool(res["truncated"]),
+        "limit": limit,
+        "affected_rows": res["affected_rows"],
+        "duration_ms": res["duration_ms"],
+        "exit_code": 0,
+        "warnings": warnings,
+    }
+    if out_path:
+        fmt = args.format or "json"
+        target = write_out(out_path, format_data(rec, res["columns"], res["rows"], fmt))
+        envelope["out_path"] = target
+        envelope["format"] = fmt
+    if JSON_MODE:
+        emit_json(envelope)
+        return 0
+    if out_path:
+        ok("已输出 %d 行到 %s（%s）" % (res["returned"], envelope["out_path"],
+                                       envelope["format"]))
+        for w in warnings:
+            warn(w)
+        return 0
+    sys.stdout.write(format_data(rec, res["columns"], res["rows"], args.format or "table"))
+    for w in warnings:
+        warn(w)
+    return 0
+
+
+def cmd_export(args):
+    cfg = current_config(args)
+    rec = require_usable(get_entry(cfg, args.name))
+    fmt = args.format or "csv"
+    if fmt not in ("csv", "json", "jsonl", "sql"):
+        die("USAGE", "--format 只支持 csv|json|jsonl|sql（table 不适合导出）")
+    check_client_metacommands(args.sql, rec["engine"])
+    write_ok = bool(getattr(args, "write", False) or getattr(args, "unsafe", False))
+    gate = _policy_gate_db(rec, args.sql, write_ok, bool(getattr(args, "unsafe", False)))
+    if gate and gate.get("decision") in ("deny", "ask"):
+        raise _raise_gate(gate)
+    warnings = list((gate or {}).get("warnings") or []) + guard_sql(
+        rec, args.sql, write_ok=write_ok, unsafe=bool(getattr(args, "unsafe", False)))
+    limit = resolve_limit(cfg, args, args.out)
+    res = execute_sql(rec, args.sql, mode="auto", timeout=args.timeout,
+                      allow_write=write_ok, limit=limit)
+    warnings.extend(res["warnings"])
+    if res["truncated"]:
+        warnings.append("导出被 --limit %d 截断（不完整）；要全量请去掉 --limit" % limit)
+    text = format_data(rec, res["columns"], res["rows"], fmt)
+    target = write_out(args.out, text)
+    summary = {
+        "ok": True, "alias": rec["name"], "engine": rec["engine"], "format": fmt,
+        "out_path": target, "columns": res["columns"], "count": res["row_count"],
+        "row_count": res["row_count"], "row_count_exact": bool(res["row_count_exact"]),
+        "returned": res["returned"], "truncated": bool(res["truncated"]),
+        "limit": limit, "bytes": len(text.encode("utf-8")),
+        "duration_ms": res["duration_ms"], "warnings": warnings,
+    }
+    if JSON_MODE:
+        emit_json(summary)
+    else:
+        ok("已导出 %d 行到 %s（%s，%d 字节）" % (res["returned"], target, fmt,
+                                                summary["bytes"]))
+        for w in warnings:
+            warn(w)
+    return 0
+
+
+def cmd_databases(args):
+    cfg = current_config(args)
+    rec = require_usable(get_entry(cfg, args.name))
+    dbs = list_databases(rec)
+    if JSON_MODE:
+        emit_json({"ok": True, "alias": rec["name"], "engine": rec["engine"],
+                   "count": len(dbs), "databases": dbs})
+        return 0
+    human()
+    for d in dbs:
+        human("  %s" % d["name"])
+    human()
+    human("  共 %d 个库" % len(dbs))
+    human()
+    return 0
+
+
+def cmd_dbinfo(args):
+    cfg = current_config(args)
+    rec = require_usable(get_entry(cfg, args.name))
+    data = dbinfo_data(rec, timeout=args.timeout)
+    if JSON_MODE:
+        emit_json(data)
+        return 0
+    human()
+    human("  别名        %s（%s / %s）" % (rec["name"], rec["engine"], rec["via"]))
+    human("  版本        %s" % (data.get("version") or "-"))
+    human("  当前库      %s" % (data.get("current_database") or "-"))
+    human("  当前用户    %s" % (data.get("current_user") or "-"))
+    human("  服务端编码  %s" % (data.get("server_encoding") or "-"))
+    human("  耗时        %sms" % data.get("duration_ms"))
+    human()
+    human("  %-24s %14s  %s" % ("库", "大小(字节)", "表数"))
+    human("  " + "-" * 50)
+    for d in data["databases"]:
+        human("  %-24s %14s  %s" % (d["name"],
+                                    d["size_bytes"] if d["size_bytes"] is not None else "-",
+                                    d["table_count"] if d["table_count"] is not None else "-"))
+    human()
+    return 0
+
+
+def cmd_tables(args):
+    cfg = current_config(args)
+    rec = require_usable(get_entry(cfg, args.name))
+    limit = resolve_limit(cfg, args)
+    tables, _ = list_tables(rec, database=args.database, limit=limit)
+    if JSON_MODE:
+        emit_json({"ok": True, "alias": rec["name"], "engine": rec["engine"],
+                   "database": args.database or rec.get("database"),
+                   "count": len(tables), "tables": tables})
+        return 0
+    human()
+    human("  %-40s %-12s %s" % ("表", "类型", "估算行数"))
+    human("  " + "-" * 70)
+    for t in tables:
+        human("  %-40s %-12s %s" % (t.get("name"), (t.get("type") or "")[:12],
+                                    t.get("rows_estimate")
+                                    if t.get("rows_estimate") is not None else "-"))
+    human()
+    human("  共 %d 张表/视图" % len(tables))
+    human()
+    return 0
+
+
+def cmd_columns(args):
+    cfg = current_config(args)
+    rec = require_usable(get_entry(cfg, args.name))
+    res = list_columns(rec, args.table, database=args.database, timeout=args.timeout)
+    cols = res["columns"] or ["name", "type", "nullable", "key", "default", "extra"]
+    items = [dict(zip(cols, r)) for r in res["rows"]]
+    if not items:
+        die("NOT_FOUND", "找不到表 %s 的列定义" % args.table,
+            "用 dbbind tables %s 看看有哪些表" % rec["name"])
+    if JSON_MODE:
+        emit_json({"ok": True, "alias": rec["name"], "engine": rec["engine"],
+                   "table": args.table, "database": args.database or rec.get("database"),
+                   "count": len(items), "columns": items})
+        return 0
+    human()
+    human("  表 %s（%d 列）" % (args.table, len(items)))
+    human()
+    human("  %-28s %-24s %-8s %-6s %s" % ("列", "类型", "可空", "键", "默认值"))
+    human("  " + "-" * 78)
+    for c in items:
+        human("  %-28s %-24s %-8s %-6s %s" % (
+            c.get("name"), (c.get("type") or "")[:24], c.get("nullable") or "-",
+            c.get("key") or "-",
+            c.get("default") if c.get("default") is not None else "-"))
+    human()
+    return 0
+
+
+def cmd_schema(args):
+    cfg = current_config(args)
+    rec = require_usable(get_entry(cfg, args.name))
+    tables, _ = list_tables(rec, database=args.database, limit=None)
+    idx_by_table = {}
+    for i in list_indexes(rec, database=args.database):
+        idx_by_table.setdefault(i.get("table"), []).append(i)
+    out = []
+    for t in tables:
+        name = t.get("name")
+        col_res = list_columns(rec, name, database=args.database, timeout=args.timeout)
+        cols = col_res["columns"] or ["name", "type", "nullable", "key", "default", "extra"]
+        out.append({"name": name, "type": t.get("type"),
+                    "columns": [dict(zip(cols, r)) for r in col_res["rows"]],
+                    "indexes": idx_by_table.get(name, [])})
+    if JSON_MODE:
+        emit_json({"ok": True, "alias": rec["name"], "engine": rec["engine"],
+                   "database": args.database or rec.get("database"),
+                   "count": len(out), "tables": out})
+        return 0
+    human()
+    for t in out:
+        human("  %s  (%s)" % (bold(t["name"]), t.get("type") or ""))
+        for c in t["columns"]:
+            human("      %-28s %-20s %s%s" % (
+                c.get("name"), (c.get("type") or "")[:20],
+                "NULL" if (c.get("nullable") or "").upper() == "YES" else "NOT NULL",
+                "  " + str(c["key"]) if c.get("key") else ""))
+        for i in t["indexes"]:
+            human("      [索引] %s%s" % (i.get("name"),
+                                         " (unique)" if i.get("unique") in (1, "1", True)
+                                         else ""))
+        human()
+    human("  共 %d 张表" % len(out))
+    human()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 命令：config / doctor
+# ---------------------------------------------------------------------------
+
+CONFIG_TEMPLATE = """{
+  // dbbind 配置文件。优先级（低 → 高）：
+  //   ~/.dbbind/config.json → 项目 .dbbind.json → ~/.dbbind/databases.json → $DBBIND_CONFIG
+  // 容错：支持 // 与 /* */ 注释、对象/数组尾随逗号；字符串里支持 $ENV / ${ENV}（$$ = 字面量 $）
+  // 校验：dbbind config validate；查看生效结果：dbbind config show
+  "version": 1,
+
+  // 所有别名的默认值，可被单个别名的同名字段覆盖
+  "defaults": { "read_only": true, "limit": 1000 },
+
+  "databases": {
+    "demo-mysql": {
+      "engine": "mysql",
+      "host": "192.0.2.10",
+      "port": 3306,
+      "user": "root",
+      "password": "$DEMO_MYSQL_PASSWORD",
+      "database": "appdb"
+    },
+
+    "demo-pg": {
+      "engine": "postgres",
+      "host": "192.0.2.10",
+      "port": 5432,
+      "user": "appuser",
+      "password": "${DEMO_PG_PASSWORD}",
+      "database": "appuser"
+    },
+
+    // 走 ssh + docker：宿主机没有客户端也能用容器里的
+    "nas-mysql": {
+      "engine": "mysql",
+      "host": "127.0.0.1",
+      "port": 3306,
+      "user": "root",
+      "password": "$NAS_MYSQL_PASSWORD",
+      "via_ssh": "demo-server",
+      "docker_exec": "demo-server:mysql-1",
+      "database": "appdb"
+    },
+
+    "local-sqlite": { "engine": "sqlite", "file": "~/data/app.db" }
+  }
+}
+"""
+
+
+def cmd_config_path(args):
+    cfg = current_config(args)
+    files = [{"path": f["path"], "kind": f["kind"], "priority": i + 1,
+              "exists": f["exists"], "readable": f["readable"],
+              "aliases": f["aliases"], "error": f["error"]}
+             for i, f in enumerate(cfg["files"])]
+    if JSON_MODE:
+        emit_json({"ok": True, "env_config": os.environ.get(CONFIG_ENV),
+                   "explicit_config": cfg["explicit_config"], "files": files,
+                   "count": len(files)})
+        return 0
+    human()
+    human("  配置文件（优先级由低到高，后者覆盖前者的同名字段）：")
+    human()
+    for f in files:
+        mark = "存在" if f["exists"] else "缺失"
+        if f["kind"] == "state":
+            extra = "dbbind add 写入"
+        elif f["kind"] == "extra":
+            extra = "--config / $%s 指定，最高优先" % CONFIG_ENV
+        elif f["kind"] == "project":
+            extra = "从当前目录逐级向上找到"
+        else:
+            extra = "全局"
+        human("   %d. %-46s %-4s %-12s %s" % (f["priority"], f["path"], mark,
+                                              f["kind"], extra))
+        if f["aliases"]:
+            human("      别名：%s" % "、".join(f["aliases"]))
+    if os.environ.get(CONFIG_ENV):
+        human()
+        human("  $%s = %s" % (CONFIG_ENV, os.environ[CONFIG_ENV]))
+    human()
+    return 0
+
+
+def cmd_config_show(args):
+    cfg = current_config(args)
+    reveal = bool(getattr(args, "reveal", False))
+    dbs = {}
+    for name, rec in cfg["entries"].items():
+        if reveal:
+            register_secret(rec.get("password"))
+        item = public_entry(rec, reveal=reveal)
+        if not reveal:
+            item["password"] = "***" if rec.get("has_password") else None
+        dbs[name] = item
+    payload = {"ok": True, "defaults": cfg["defaults"],
+               "files": [{"path": f["path"], "kind": f["kind"], "exists": f["exists"]}
+                         for f in cfg["files"]],
+               "count": len(dbs), "databases": dbs}
+    if JSON_MODE:
+        emit_json(payload)
+        return 0
+    human()
+    human("  生效默认值：read_only=%s  limit=%s" % (cfg["defaults"].get("read_only"),
+                                                   cfg["defaults"].get("limit")))
+    human()
+    for name in sorted(dbs):
+        e = dbs[name]
+        human("  %s（%s，%s，%s）" % (bold(name), e["engine"], e["origin"],
+                                     "可用" if e["usable"] else "不可用"))
+        human("      %s" % entry_summary(cfg["entries"][name]))
+        human("      密码：%s" % (e.get("password") if reveal
+                                  else ("***" if e["has_password"] else "（无）")))
+        if e["config_file"]:
+            human("      来自：%s" % e["config_file"])
+        if not e["usable"]:
+            human("      原因：%s" % e["usable_reason"])
+    human()
+    return 0
+
+
+def cmd_config_init(args):
+    target = os.path.abspath(os.path.join(os.getcwd(), PROJECT_CONFIG_NAME)) if args.project \
+        else GLOBAL_CONFIG
+    if os.path.exists(target):
+        die("USAGE", "文件已存在，不会覆盖：%s" % target,
+            "要看内容：dbbind config show；要改就直接编辑它")
+    d = os.path.dirname(target)
+    if d and not os.path.isdir(d):
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError as e:
+            die("USAGE", "无法创建目录 %s：%s" % (d, e))
+    try:
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(CONFIG_TEMPLATE)
+        os.chmod(target, 0o644)
+    except OSError as e:
+        die("USAGE", "写入失败：%s\n  %s" % (target, e))
+    if JSON_MODE:
+        emit_json({"ok": True, "path": target, "project": bool(args.project)})
+    else:
+        ok("已生成配置模板：%s" % target)
+        human("  下一步：填好 password（或写成 $ENV），然后")
+        human("      dbbind config validate")
+        human("      dbbind list --json")
+    return 0
+
+
+def cmd_config_validate(args):
+    issues, files_report = [], []
+    cfg = None
+    try:
+        cfg = load_effective_config(explicit=getattr(args, "config", None))
+    except DbbindError as e:
+        issues.append({"severity": "error", "code": e.code,
+                       "message": redact(e.message), "hint": e.hint})
+    if cfg:
+        for f in cfg["files"]:
+            problems = 0
+            if f["exists"] and not f["readable"]:
+                issues.append({"severity": "error", "file": f["path"], "message": "文件不可读"})
+                problems += 1
+            for u in f["unknown_fields"]:
+                issues.append({"severity": "warning", "file": f["path"], "message": u,
+                               "hint": "未知字段会被忽略，注意是否拼错"})
+                problems += 1
+            files_report.append({"path": f["path"], "kind": f["kind"], "exists": f["exists"],
+                                 "readable": f["readable"], "aliases": len(f["aliases"]),
+                                 "problems": problems})
+        for alias, field, name in cfg["missing_env"]:
+            issues.append({"severity": "error", "alias": alias, "field": field,
+                           "message": "环境变量 $%s 未设置（别名 %s 的 %s）"
+                                      % (name, alias, field),
+                           "hint": "export %s=... 后再试" % name})
+        for name, rec in cfg["entries"].items():
+            if not rec.get("usable"):
+                issues.append({"severity": "error", "alias": name,
+                               "message": rec.get("usable_reason") or "不可用"})
+    errors = [i for i in issues if i["severity"] == "error"]
+    payload = {"ok": not issues, "count": len(issues), "errors": len(errors),
+               "files": files_report, "issues": issues}
+    if JSON_MODE:
+        emit_json(payload)
+    else:
+        human()
+        for i in issues:
+            human("  [%s] %s %s" % ("错误" if i["severity"] == "error" else "警告",
+                                    i.get("file") or i.get("alias") or "", i["message"]))
+            if i.get("hint"):
+                human("         %s" % i["hint"])
+        human()
+        human("  发现 %d 个问题（%d 个错误）" % (len(issues), len(errors)) if issues
+              else "  %s" % (C_OK + "配置检查通过" + C_OFF))
+        human()
+    return 0 if not issues else EXIT_ERR
+
+
+def cmd_doctor(args):
+    checks = []
+
+    def check(name, good, detail="", hint=""):
+        checks.append({"name": name, "ok": bool(good), "detail": detail, "hint": hint})
+        return good
+
+    check("python3", sys.version_info >= (3, 6), "Python %s" % sys.version.split()[0])
+    for eng in ENGINE_NAMES:
+        path, tried = find_client(eng)
+        check("%s 客户端" % CLIENT_NAMES[eng], bool(path),
+              path or "未找到；已尝试 %d 个位置" % len(tried),
+              "brew install %s" % ("mysql-client" if eng == "mysql"
+                                   else ("libpq" if eng == "postgres" else "sqlite")))
+    check("ssh 命令（ssh / docker 通道）", bool(shutil.which("ssh")),
+          shutil.which("ssh") or "未找到")
+    check("docker 命令（本机 docker 通道）", bool(shutil.which("docker")),
+          shutil.which("docker") or "未找到（只有本机 docker 通道才需要）")
+
+    structural = 0
+    if not os.path.isdir(BASE_DIR):
+        structural += 1
+        check("状态目录存在", False, BASE_DIR)
+    else:
+        mode = os.stat(BASE_DIR).st_mode & 0o777
+        if mode != 0o700:
+            structural += 1
+        check("状态目录权限 0700", mode == 0o700, "%s (%o)" % (BASE_DIR, mode),
+              "chmod 700 %s" % BASE_DIR)
+    check("AGENT.md", os.path.isfile(AGENT_FILE), AGENT_FILE)
+    if os.path.isfile(STATE_FILE):
+        mode = os.stat(STATE_FILE).st_mode & 0o777
+        if mode != 0o600:
+            structural += 1
+        check("databases.json 权限 0600", mode == 0o600,
+              "%s (%o)" % (STATE_FILE, mode), "chmod 600 %s" % STATE_FILE)
+    else:
+        check("databases.json", True, "尚未创建（add 时创建）")
+
+    cfg = None
+    try:
+        cfg = load_effective_config(explicit=getattr(args, "config", None))
+    except DbbindError as e:
+        structural += 1
+        check("配置可解析", False, redact(e.message), e.hint)
+    config_report = {"files": [], "unknown_fields": [], "missing_env": []}
+    if cfg:
+        for f in cfg["files"]:
+            config_report["files"].append(
+                {"path": f["path"], "kind": f["kind"], "exists": f["exists"],
+                 "readable": f["readable"], "aliases": f["aliases"]})
+        config_report["unknown_fields"] = cfg["unknown_fields"]
+        config_report["missing_env"] = ["%s.%s ($%s)" % (a, f, n)
+                                        for a, f, n in cfg["missing_env"]]
+        check("配置可解析", True,
+              "、".join("%s(%s)" % (f["path"], "存在" if f["exists"] else "缺失")
+                        for f in cfg["files"]))
+        check("配置无未知字段", not cfg["unknown_fields"],
+              "；".join(cfg["unknown_fields"][:4]) or "无", "拼错的字段会被忽略，改掉它")
+        check("$ENV 环境变量齐全", not cfg["missing_env"],
+              "；".join("$%s" % n for _, _, n in cfg["missing_env"]) or "无",
+              "在 shell 里 export 这些变量")
+
+    entries = list((cfg or {}).get("entries", {}).values())
+    usable = [e for e in entries if e.get("usable")]
+    unusable = [e for e in entries if not e.get("usable")]
+    for e in unusable:
+        warn("别名 %s 不可用：%s" % (e["name"], e.get("usable_reason")))
+
+    payload = {
+        "ok": structural == 0, "version": VERSION, "python": sys.version.split()[0],
+        "home": BASE_DIR, "state_file": STATE_FILE, "checks": checks,
+        "clients": {eng: {"found": bool(find_client(eng)[0]), "path": find_client(eng)[0]}
+                    for eng in ENGINE_NAMES},
+        "config": config_report,
+        "databases": {"count": len(entries), "usable": len(usable), "unusable": len(unusable),
+                      "unusable_reasons": [{"name": e["name"],
+                                            "reason": e.get("usable_reason")}
+                                           for e in unusable]},
+        "structural_problems": structural,
+    }
+    if JSON_MODE:
+        emit_json(payload)
+        return 0 if structural == 0 else EXIT_ERR
+    human()
+    for c in checks:
+        human("  %s %s%s" % ("✅" if c["ok"] else "⚠️ ", c["name"],
+                             ("  %s" % c["detail"]) if c["detail"] else ""))
+        if not c["ok"] and c["hint"]:
+            human("      %s" % c["hint"])
+    human()
+    human("  别名：%d 个（可用 %d，不可用 %d）" % (len(entries), len(usable), len(unusable)))
+    for e in entries:
+        human("    %-20s %-9s %-8s %s" % (e["name"], e["engine"], e.get("origin"),
+                                          "可用" if e["usable"]
+                                          else "不可用 — %s" % e.get("usable_reason")))
+    human()
+    human("  状态目录：%s" % BASE_DIR)
+    human("  配置文件：%s" % "、".join(f["path"] for f in (cfg or {}).get("files", [])
+                                      if f["exists"]))
+    human()
+    human("  %s" % (C_OK + "环境自检通过" + C_OFF) if not structural
+          else "  %s" % (C_WARN + "发现 %d 个结构性问题（见上）" % structural + C_OFF))
+    human()
+    return 0 if structural == 0 else EXIT_ERR
+
+
+# ---------------------------------------------------------------------------
+# argparse / 入口
+# ---------------------------------------------------------------------------
+
+def _add_common(p):
+    p.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                   help="只输出 JSON（人类可读信息走 stderr）")
+    p.add_argument("--config", metavar="PATH", default=argparse.SUPPRESS,
+                   help="额外的配置文件（最高优先，等价于 $%s）" % CONFIG_ENV)
+
+
+def build_parser():
+    common = _Parser(add_help=False)
+    _add_common(common)
+    p = _Parser(
+        prog=PROG,
+        description="dbbind — 数据库连接绑定管理器：绑定一次，之后 AI/脚本按别名免密操作数据库。",
+        epilog="配置文件是首选入口：~/.dbbind/config.json、项目 .dbbind.json、$%s\n"
+               "例：\n"
+               "  dbbind list --json\n"
+               "  dbbind exec --json demo-mysql \"select 1\"\n"
+               "  dbbind dbinfo demo-pg\n"
+               "  dbbind doctor\n"
+               "  dbbind --startserver [--port 8791] [--host 127.0.0.1] [--daemon] [--open]\n"
+               "      # Web 控制台；--host HOST 监听地址（默认 127.0.0.1，局域网访问用 0.0.0.0）\n"
+               % CONFIG_ENV,
+        formatter_class=argparse.RawDescriptionHelpFormatter, parents=[common])
+    p.add_argument("--version", action="store_true", help="显示版本（支持 --json）")
+    sub = p.add_subparsers(dest="cmd")
+
+    a = sub.add_parser("add", parents=[common],
+                       help="绑定数据库并写入 databases.json（配置文件之外的补充入口）")
+    a.add_argument("name", help="别名")
+    a.add_argument("--engine", required=True, choices=list(ENGINE_NAMES))
+    a.add_argument("--host", help="地址（mysql/postgres 必填）")
+    a.add_argument("--port", type=int, help="端口（默认 mysql 3306 / postgres 5432）")
+    a.add_argument("--user", help="用户名（mysql/postgres 必填）")
+    a.add_argument("--password", help="密码（会进 ps，建议用 --password-stdin）")
+    a.add_argument("--password-stdin", action="store_true", help="从标准输入读密码")
+    a.add_argument("--database", help="默认库")
+    a.add_argument("--file", help="sqlite 数据库文件")
+    a.add_argument("--via-ssh", metavar="ALIAS", help="通过 sshbind 别名在远端执行")
+    a.add_argument("--docker-exec", metavar="TARGET", help="docker 通道：[ssh别名:]容器名")
+    a.add_argument("--read-only", action="store_true", help="只读（默认）")
+    a.add_argument("--allow-write", action="store_true", help="允许写（含 DDL）")
+    a.add_argument("--force", action="store_true", help="覆盖同名别名")
+    a.add_argument("--test", action="store_true", help="添加后立即连通性测试")
+    a.set_defaults(func=cmd_add)
+
+    l = sub.add_parser("list", parents=[common], help="列出所有别名")
+    l.add_argument("--engine", choices=list(ENGINE_NAMES), help="只看某个引擎")
+    l.add_argument("--origin", choices=list(ORIGIN_NAMES), help="只看某个来源")
+    l.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("show", parents=[common], help="查看某个别名的详情")
+    s.add_argument("name")
+    s.add_argument("--reveal", action="store_true", help="显示明文密码（默认打码）")
+    s.set_defaults(func=cmd_show)
+
+    t = sub.add_parser("test", parents=[common], help="连通性测试（省略别名=测试全部）")
+    t.add_argument("name", nargs="?", help="别名")
+    t.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    t.set_defaults(func=cmd_test)
+
+    r = sub.add_parser("remove", parents=[common], help="删除绑定（只删 databases.json 记录）")
+    r.add_argument("name")
+    r.add_argument("--yes", action="store_true", help="跳过二次确认（非交互终端必须给）")
+    r.set_defaults(func=cmd_remove)
+
+    ex = sub.add_parser("exec", parents=[common], help="执行 SQL（agent 首选入口）")
+    ex.add_argument("--write", action="store_true", help="本次放行数据修改（DML）")
+    ex.add_argument("--unsafe", action="store_true", help="放行 DML+DDL 并记 warning")
+    ex.add_argument("--limit", type=int, default=None,
+                    help="返回行数上限；默认取配置 defaults.limit；0=只探测有没有数据；"
+                         "负数报错；--out 落盘时不传则不限")
+    ex.add_argument("--format", choices=["json", "jsonl", "csv", "table"], default=None,
+                    help="stdout 数据格式（默认 table；--json 时以 JSON 信封为准）")
+    ex.add_argument("--out", help="把结果写入文件（此时不传 --limit 就是完整导出）")
+    ex.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    ex.add_argument("--database", help="临时指定默认库")
+    ex.add_argument("alias")
+    ex.add_argument("sql")
+    ex.set_defaults(func=cmd_exec)
+
+    e = sub.add_parser("export", parents=[common], help="导出查询结果到文件")
+    e.add_argument("--out", required=True, help="输出文件")
+    e.add_argument("--format", choices=["csv", "json", "jsonl", "sql"], default="csv")
+    e.add_argument("--limit", type=int, default=None,
+                   help="行数上限；不传=不限（完整导出），0=只探测有没有数据，负数报错")
+    e.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    e.add_argument("--write", action="store_true", help="本次放行 DML")
+    e.add_argument("--unsafe", action="store_true", help="放行 DML+DDL")
+    e.add_argument("alias")
+    e.add_argument("sql")
+    e.set_defaults(func=cmd_export)
+
+    d = sub.add_parser("databases", parents=[common], help="列出库")
+    d.add_argument("alias")
+    d.set_defaults(func=cmd_databases)
+
+    di = sub.add_parser("dbinfo", parents=[common], help="服务器信息：版本/当前库/编码/库清单")
+    di.add_argument("alias")
+    di.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    di.set_defaults(func=cmd_dbinfo)
+
+    tb = sub.add_parser("tables", parents=[common], help="列出表")
+    tb.add_argument("alias")
+    tb.add_argument("--database", help="库名")
+    tb.add_argument("--limit", type=int, default=None)
+    tb.set_defaults(func=cmd_tables)
+
+    co = sub.add_parser("columns", parents=[common], help="列出列定义")
+    co.add_argument("alias")
+    co.add_argument("table", help="表名（可带库/schema 前缀）")
+    co.add_argument("--database", help="库名")
+    co.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    co.set_defaults(func=cmd_columns)
+
+    sc = sub.add_parser("schema", parents=[common], help="整库结构：表 + 列 + 索引")
+    sc.add_argument("alias")
+    sc.add_argument("--database", help="库名")
+    sc.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    sc.set_defaults(func=cmd_schema)
+
+    cf = sub.add_parser("config", parents=[common], help="配置文件相关")
+    csub = cf.add_subparsers(dest="config_cmd")
+    c1 = csub.add_parser("path", parents=[common], help="生效的配置文件清单")
+    c1.set_defaults(func=cmd_config_path)
+    c2 = csub.add_parser("show", parents=[common], help="展示合并后的最终配置")
+    c2.add_argument("--reveal", action="store_true", help="显示明文密码（默认打码）")
+    c2.set_defaults(func=cmd_config_show)
+    c3 = csub.add_parser("init", parents=[common], help="生成配置模板")
+    c3.add_argument("--project", action="store_true", help="写当前目录的 .dbbind.json")
+    c3.set_defaults(func=cmd_config_init)
+    c4 = csub.add_parser("validate", parents=[common], help="校验：语法/未知字段/$ENV/必填")
+    c4.set_defaults(func=cmd_config_validate)
+    cf.set_defaults(func=cmd_config_path)
+
+    doc = sub.add_parser("doctor", parents=[common], help="环境与配置自检")
+    doc.set_defaults(func=cmd_doctor)
+
+    return p
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # bindconsole 契约 §2：先扫描 --startserver，保证不影响任何既有子命令
+    if "--startserver" in argv:
+        set_json_mode(False)
+        try:
+            return start_console_mode(argv)
+        except DbbindError as e:
+            report_error(e)
+            return e.exit_code
+        except KeyboardInterrupt:
+            warn("已中断")
+            return 130
+        except Exception as e:                 # noqa: BLE001
+            sys.stderr.write("ERROR 控制台启动失败：%s\n" % e)
+            return EXIT_ERR
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    # 位置参数：add/show/test/remove 里叫 name，数据命令里叫 alias —— 统一成 args.name，
+    # 免得两个名字各写一半（曾经真的踩过：exec/dbinfo/tables 全部 AttributeError）
+    if getattr(args, "name", None) is None and getattr(args, "alias", None) is not None:
+        args.name = args.alias
+    set_json_mode(bool(getattr(args, "json", False)))
+    if args.version:
+        if JSON_MODE:
+            emit_json({"ok": True, "program": PROG, "version": VERSION})
+        else:
+            print("%s %s" % (PROG, VERSION))
+        return EXIT_OK
+    if not getattr(args, "cmd", None):
+        parser.print_help()
+        return EXIT_OK
+    try:
+        ensure_init()
+        rc = args.func(args)
+        return EXIT_OK if rc is None else rc
+    except DbbindError as e:
+        report_error(e)
+        return e.exit_code
+    except KeyboardInterrupt:
+        warn("已中断")
+        return 130
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

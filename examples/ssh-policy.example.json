@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "defaults": {"sudo": "ask", "approval_ttl_s": 600},
+  "servers": {"demo-server": {"sudo": "deny"}}
+}

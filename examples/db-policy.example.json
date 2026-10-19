@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "defaults": {"max_level": "read", "allow_metadata": true, "approval_ttl_s": 600},
+  "databases": {
+    "demo-pg": {
+      "max_level": "write", "allowed_databases": ["appdb"], "allowed_schemas": ["public"],
+      "allowed_tables": ["users", "orders"], "approval": {"write": true, "ddl": true}
+    }
+  }
+}

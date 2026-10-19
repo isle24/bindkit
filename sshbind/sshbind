@@ -1,0 +1,2163 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+sshbind — Linux 服务器 SSH 密钥绑定管理器
+
+设计目标：绑定一次，之后永久免密登录；密钥可集中查看、测试、吊销。
+
+支持三种「首次认证」方式，不限于密码：
+    sshbind add <名称> --host <地址>                      # 用密码认证一次
+    sshbind add <名称> --host <地址> --identity ~/.ssh/id_rsa   # 用已有私钥认证
+    sshbind add <名称> --host <地址> --agent               # 用 ssh-agent 认证
+
+也可以直接纳管你现有的密钥（不生成新密钥、不推送任何东西）：
+    sshbind adopt <名称> --host <地址> --identity ~/.ssh/id_rsa
+
+其他命令：
+    sshbind list / show / test / pubkey / remove / doctor
+
+安全设计：
+  * 密码/口令只通过「临时文件 + SSH_ASKPASS」传给 ssh，绝不出现在命令行参数里
+    （argv 会暴露在 ps 输出中；临时文件权限 600，用完覆写零字节再删除）
+  * add 默认每台服务器一把独立密钥（ed25519），互不牵连
+  * adopt 只登记不复制，remove 时默认不会删除你原有的密钥文件
+  * 私钥目录 700、私钥文件 600、状态文件 600
+  * 密码与口令不会被记录、不会写进任何日志或状态文件
+
+依赖：系统自带 python3 + OpenSSH（macOS 自带，无需 brew install 任何东西）
+"""
+
+import argparse
+import base64
+import getpass
+import glob as glob_mod
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime
+
+# ---------------------------------------------------------------------------
+# 路径与常量
+# ---------------------------------------------------------------------------
+
+BASE_DIR = os.path.join(os.path.expanduser("~"), ".ssh", "sshbind")
+KEYS_DIR = os.path.join(BASE_DIR, "keys")
+STATE_FILE = os.path.join(BASE_DIR, "servers.json")
+SSH_DIR = os.path.join(os.path.expanduser("~"), ".ssh")
+SSH_CONFIG = os.path.join(SSH_DIR, "config")
+
+BLOCK_BEGIN = "# >>> sshbind managed block — 由 sshbind 自动生成，请勿手工编辑 >>>"
+BLOCK_END = "# <<< sshbind managed block <<<"
+
+C_OK = "\033[32m"
+C_WARN = "\033[33m"
+C_ERR = "\033[31m"
+C_DIM = "\033[2m"
+C_BOLD = "\033[1m"
+C_OFF = "\033[0m"
+
+
+def _tty():
+    return sys.stdout.isatty()
+
+
+def ok(msg):
+    print(("%s✅ %s%s" % (C_OK, msg, C_OFF)) if _tty() else "OK   " + msg)
+
+
+def info(msg):
+    print(("%s→ %s%s" % (C_DIM, msg, C_OFF)) if _tty() else "     " + msg)
+
+
+def warn(msg):
+    sys.stdout.flush()   # 保证警告在管道/重定向下仍按逻辑顺序出现
+    print(("%s⚠️  %s%s" % (C_WARN, msg, C_OFF)) if _tty() else "WARN " + msg,
+          file=sys.stderr)
+    sys.stderr.flush()
+
+
+def die(msg, code=1):
+    sys.stdout.flush()
+    print(("%s❌ %s%s" % (C_ERR, msg, C_OFF)) if _tty() else "ERROR " + msg,
+          file=sys.stderr)
+    sys.exit(code)
+
+
+def bold(msg):
+    return ("%s%s%s" % (C_BOLD, msg, C_OFF)) if _tty() else msg
+
+
+def ask_yes_no(prompt, default=True):
+    """交互式询问；非终端环境（管道/脚本）下直接返回默认值，不抛 EOFError。"""
+    if not sys.stdin.isatty():
+        return default
+    try:
+        ans = input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+    if not ans:
+        return default
+    return ans in ("y", "yes")
+
+
+# ---------------------------------------------------------------------------
+# 状态读写
+# ---------------------------------------------------------------------------
+
+def ensure_dirs():
+    for d in (BASE_DIR, KEYS_DIR, SSH_DIR):
+        os.makedirs(d, exist_ok=True)
+    for d in (BASE_DIR, KEYS_DIR):
+        os.chmod(d, 0o700)
+
+
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {"version": 1, "servers": {}}
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (ValueError, OSError) as e:
+        die("状态文件损坏，无法解析：%s\n  %s" % (STATE_FILE, e))
+    data.setdefault("version", 1)
+    data.setdefault("servers", {})
+    return data
+
+
+def save_state(state):
+    ensure_dirs()
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE_FILE)
+
+
+# ---------------------------------------------------------------------------
+# 密码 / 口令传递：临时文件 + SSH_ASKPASS（避免出现在 ps / argv 里）
+# ---------------------------------------------------------------------------
+
+class SecretHandle(object):
+    """把密码或口令写进 600 权限的临时文件供 SSH_ASKPASS 读取，退出时粉碎删除。"""
+
+    def __init__(self, secret):
+        self.dir = tempfile.mkdtemp(prefix="sshbind-")
+        os.chmod(self.dir, 0o700)
+        pw_path = os.path.join(self.dir, "secret")
+        fd = os.open(pw_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(secret + "\n")
+        ask = os.path.join(self.dir, "askpass.sh")
+        with open(ask, "w") as f:
+            f.write("#!/bin/sh\nexec cat %s\n" % shlex.quote(pw_path))
+        os.chmod(ask, 0o700)
+        self.askpass = ask
+        self.secret_path = pw_path
+
+    def env(self):
+        env = dict(os.environ)
+        env["SSH_ASKPASS"] = self.askpass
+        env["SSH_ASKPASS_REQUIRE"] = "force"   # OpenSSH 8.4+，强制用 askpass
+        env.setdefault("DISPLAY", ":0")
+        return env
+
+    def close(self):
+        try:
+            if os.path.exists(self.secret_path):
+                size = os.path.getsize(self.secret_path)
+                with open(self.secret_path, "r+b") as f:
+                    f.write(b"\0" * size)
+        except OSError:
+            pass
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+# ---------------------------------------------------------------------------
+# 认证方式抽象
+# ---------------------------------------------------------------------------
+
+AUTH_PASSWORD = "password"
+AUTH_KEY = "key"
+AUTH_AGENT = "agent"
+
+
+def make_auth(mode, password=None, identities=None, passphrase=None):
+    return {"mode": mode, "password": password,
+            "identities": identities or [], "passphrase": passphrase}
+
+
+def auth_ssh_opts(auth):
+    """把认证方式翻译成 ssh 选项，并返回需要随行清理的 SecretHandle（可能为 None）。"""
+    opts, handle = [], None
+    mode = auth["mode"]
+
+    if mode == AUTH_PASSWORD:
+        opts += ["-o", "PubkeyAuthentication=no",
+                 "-o", "PreferredAuthentications=password,keyboard-interactive",
+                 "-o", "NumberOfPasswordPrompts=1"]
+        handle = SecretHandle(auth["password"])
+
+    elif mode == AUTH_KEY:
+        for f in auth["identities"]:
+            opts += ["-i", os.path.expanduser(f)]
+        opts += ["-o", "IdentitiesOnly=yes",
+                 "-o", "PreferredAuthentications=publickey",
+                 "-o", "NumberOfPasswordPrompts=1"]
+        if auth.get("passphrase"):
+            handle = SecretHandle(auth["passphrase"])
+
+    elif mode == AUTH_AGENT:
+        opts += ["-o", "PreferredAuthentications=publickey",
+                 "-o", "IdentitiesOnly=no"]
+
+    return opts, handle
+
+
+def auth_label(auth):
+    if auth["mode"] == AUTH_PASSWORD:
+        return "密码"
+    if auth["mode"] == AUTH_KEY:
+        return "私钥 %s" % ", ".join(os.path.basename(i) for i in auth["identities"])
+    return "ssh-agent"
+
+
+def key_is_encrypted(path):
+    """判断私钥是否带口令（不需要口令即可判断）。
+
+    OpenSSH 新格式（-----BEGIN OPENSSH PRIVATE KEY-----）的二进制结构是：
+        "openssh-key-v1\\0" + [4字节长度 + ciphername] + [4字节长度 + kdfname] + ...
+    未加密时 ciphername == "none"；加密时为 "aes256-ctr" 等。
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        return False
+
+    # 老式 PEM（RSA/DSA/EC）加密时会有这个头
+    if "Proc-Type: 4,ENCRYPTED" in content or "ENCRYPTED" in content:
+        return True
+
+    m = re.search(r"-----BEGIN OPENSSH PRIVATE KEY-----\s*(.+?)\s*-----END",
+                  content, re.S)
+    if not m:
+        return False
+    try:
+        blob = base64.b64decode("".join(m.group(1).split()))
+    except (ValueError, TypeError):
+        return False
+
+    prefix = b"openssh-key-v1\x00"
+    if not blob.startswith(prefix):
+        return False
+    rest = blob[len(prefix):]
+    if len(rest) < 4:
+        return False
+    try:
+        n = int.from_bytes(rest[:4], "big")
+        cipher = rest[4:4 + n].decode("ascii", "replace")
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return cipher != "none"
+
+
+# ---------------------------------------------------------------------------
+# DES（用于解密 FinalShell 保存的密码）
+#
+# 说明：只实现解密 + 密钥派生。凭据是你自己机器上、你自己工具里的数据，
+# 解密结果仅在内存中使用一次，不会打印、不会写入磁盘。
+# ---------------------------------------------------------------------------
+
+def des_ecb_decrypt(data, key8):
+    """DES-ECB 解密。依次尝试 cryptography / pycryptodome / 系统 openssl，避免强制装依赖。"""
+    # 后端 1：cryptography（TripleDES 用 8 字节密钥时等价于单 DES）
+    try:
+        import warnings
+        from cryptography.hazmat.primitives.ciphers import Cipher, modes
+        try:
+            from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES
+        except ImportError:
+            from cryptography.hazmat.primitives.ciphers.algorithms import TripleDES
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            dec = Cipher(TripleDES(key8), modes.ECB()).decryptor()
+            out = dec.update(data) + dec.finalize()
+        if len(out) == len(data):
+            return out
+    except Exception:
+        pass
+
+    # 后端 2：pycryptodome
+    try:
+        from Crypto.Cipher import DES as _DES
+        out = _DES.new(key8, _DES.MODE_ECB).decrypt(data)
+        if len(out) == len(data):
+            return out
+    except Exception:
+        pass
+
+    # 后端 3：openssl 命令行。macOS 自带 /usr/bin/openssl(LibreSSL) 直接支持 des-ecb；
+    #          Homebrew 的 OpenSSL 3.x 需要显式加载 legacy provider。
+    for argv in (["/usr/bin/openssl", "enc", "-d", "-des-ecb"],
+                 ["/usr/bin/openssl", "enc", "-d", "-des-ecb", "-nopad"],
+                 ["openssl", "enc", "-d", "-des-ecb", "-provider", "legacy",
+                  "-provider", "default"]):
+        try:
+            p = subprocess.run(argv + ["-K", key8.hex()],
+                               input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if p.returncode == 0 and len(p.stdout) == len(data):
+                return p.stdout
+        except OSError:
+            continue
+
+    raise RuntimeError("找不到可用的 DES 实现（cryptography / pycryptodome / openssl 均不可用）")
+
+
+class JavaRandom(object):
+    """精确复刻 java.util.Random（JDK 8+），FinalShell 用它的 nextLong 派生密钥。"""
+
+    MULTIPLIER = 0x5DEECE66D
+    ADDEND = 0xB
+    MASK = (1 << 48) - 1
+
+    def __init__(self, seed):
+        if seed < 0:
+            seed += (1 << 64)
+        self._seed = (seed ^ self.MULTIPLIER) & self.MASK
+
+    def _next(self, bits):
+        self._seed = (self._seed * self.MULTIPLIER + self.ADDEND) & self.MASK
+        result = self._seed >> (48 - bits)
+        if bits >= 32 and result >= 0x80000000:
+            result -= 0x100000000
+        return result
+
+    def next_int(self, bound=None):
+        if bound is None:
+            return self._next(32)
+        if bound <= 0:
+            raise ValueError("bound must be positive")
+        r = self._next(31)
+        m = bound - 1
+        if (bound & m) == 0:
+            r = (bound * r) >> 31
+        else:
+            u = r
+            r = u % bound
+            while u - r + m < 0:
+                u = self._next(31)
+                r = u % bound
+        return r
+
+    def next_long(self):
+        hi = self._next(32)
+        lo = self._next(32)
+        val = ((hi << 32) + lo) & 0xFFFFFFFFFFFFFFFF
+        if val >= 0x8000000000000000:
+            val -= 0x10000000000000000
+        return val
+
+
+def _signed(b):
+    return b - 256 if b >= 128 else b
+
+
+def finalshell_derive_key(head):
+    """由密文头部 8 字节派生 DES 密钥（8 字节）。"""
+    rand_for_divisor = JavaRandom(_signed(head[5]))
+    divisor = rand_for_divisor.next_int(127) or 1
+    ks = 3680984568597093857 // divisor
+
+    random_ = JavaRandom(ks)
+    t = _signed(head[0])
+    for _ in range(t if t > 0 else 0):
+        random_.next_long()
+
+    r2 = JavaRandom(random_.next_long())
+
+    longs = [
+        _signed(head[4]), r2.next_long(), _signed(head[7]), _signed(head[3]),
+        r2.next_long(), _signed(head[1]), random_.next_long(), _signed(head[2]),
+    ]
+    key_data = b"".join(struct.pack(">q", v) for v in longs)
+    return hashlib.md5(key_data).digest()[:8]
+
+
+def finalshell_decode_password(encoded):
+    """解密 FinalShell 的 password 字段。返回明文 str，失败抛异常。"""
+    if not encoded:
+        return ""
+    buf = base64.b64decode(encoded.strip())
+    if len(buf) <= 8:
+        raise ValueError("密文长度不足")
+    head, body = buf[:8], buf[8:]
+    key = finalshell_derive_key(head)
+    raw = des_ecb_decrypt(body, key)
+    pad = raw[-1] if raw else 0
+    if 1 <= pad <= 8 and raw.endswith(bytes([pad]) * pad):
+        raw = raw[:-pad]
+    return raw.decode("utf-8", errors="replace")
+
+
+# ---------------------------------------------------------------------------
+# 从其他 SSH 客户端导入
+# ---------------------------------------------------------------------------
+
+FINALSSHELL_DIRS = [
+    os.path.join(os.path.expanduser("~"), "Library", "FinalShell"),
+    os.path.join(os.path.expanduser("~"), ".finalshell"),
+    os.path.join(os.path.expanduser("~"), "Library", "Application Support", "finalshell"),
+]
+
+# SSH config 的 Host 别名只接受这些字符（中文会报 "hostname contains invalid characters"）
+ALIAS_SAFE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def make_alias(preferred, host, taken):
+    """把任意名称转成 SSH config 能接受的 ASCII 别名，并保证不重复。"""
+    base = ALIAS_SAFE.sub("", (preferred or "").strip())
+    base = base.strip("._-")
+    if not base or not re.match(r"^[A-Za-z0-9]", base):
+        base = ALIAS_SAFE.sub("-", (host or "").strip()).strip("-")
+        base = re.sub(r"-+", "-", base)
+    if not base:
+        base = "server"
+    base = base[:48]
+    alias, n = base, 2
+    while alias in taken:
+        alias = "%s-%d" % (base, n)
+        n += 1
+    return alias
+
+
+def find_finalshell_dir(explicit=None):
+    for d in ([explicit] if explicit else FINALSSHELL_DIRS):
+        if d and os.path.isdir(os.path.join(d, "conn")):
+            return d
+    return None
+
+
+def parse_finalshell(base_dir):
+    """解析 FinalShell 的连接配置。返回 (连接列表, 密钥型连接数)。"""
+    conn_dir = os.path.join(base_dir, "conn")
+    conns, keyed = [], 0
+    for path in sorted(glob_mod.glob(os.path.join(conn_dir, "*_connect_config.json"))):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            continue
+        host = (d.get("host") or "").strip()
+        if not host:
+            continue
+        is_key = bool(d.get("secret_key_id")) or d.get("authentication_type") == 2
+        if is_key:
+            keyed += 1
+        conns.append({
+            "name": (d.get("name") or host).strip(),
+            "host": host,
+            "port": int(d.get("port") or 22),
+            "user": (d.get("user_name") or "root").strip(),
+            "password_enc": d.get("password") or "",
+            "is_key": is_key,
+            "source_file": path,
+        })
+    return conns, keyed
+
+
+# ---------------------------------------------------------------------------
+# ssh 调用封装
+# ---------------------------------------------------------------------------
+
+BASE_SSH_OPTS = [
+    "-o", "StrictHostKeyChecking=accept-new",   # 首次自动记录主机指纹
+    "-o", "ConnectTimeout=15",
+    "-o", "ServerAliveInterval=30",
+    "-o", "ServerAliveCountMax=3",
+]
+
+
+def ssh_base(host, user, port):
+    return ["ssh"] + BASE_SSH_OPTS + ["-p", str(port)]
+
+
+def ssh_with_key(host, user, port, keyfile, certificate=None, batch=True):
+    """用指定私钥构造 ssh 命令；batch=True 时禁止回退到密码，真正验证密钥生效。"""
+    cmd = ssh_base(host, user, port) + ["-i", keyfile, "-o", "IdentitiesOnly=yes"]
+    if certificate:
+        cmd += ["-o", "CertificateFile=%s" % certificate]
+    if batch:
+        cmd += ["-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
+                "-o", "PreferredAuthentications=publickey"]
+    cmd.append("%s@%s" % (user, host))
+    return cmd
+
+
+def run_ssh(cmd, secret_handle=None, stdin_data=None, timeout=120):
+    env = secret_handle.env() if secret_handle else None
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=(stdin_data.encode("utf-8") if stdin_data is not None else None),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=(subprocess.DEVNULL if stdin_data is None else None),
+            env=env,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, "", "超时（%ss）：无法在限定时间内完成" % timeout
+    return (proc.returncode,
+            proc.stdout.decode("utf-8", "replace"),
+            proc.stderr.decode("utf-8", "replace"))
+
+
+def classify_ssh_error(rc, err, out, timeout=120):
+    """把 ssh 的报错翻译成人话。"""
+    e = err or ""
+    if rc == 124:
+        return "连接超时"
+    if "Permission denied" in e or "Authentication failed" in e:
+        return "认证失败：凭据不正确，或服务器不接受这种认证方式"
+    if "no such identity" in e or "No such file or directory" in e:
+        return "找不到指定的私钥文件"
+    if "Connection refused" in e:
+        return "连接被拒绝：地址或端口不正确，或未开放 SSH"
+    if "Connection timed out" in e or "Operation timed out" in e:
+        return "连接超时：网络不可达或被防火墙拦截"
+    if "Host key verification failed" in e:
+        return "主机密钥校验失败（可能是中间人攻击，或主机重装过）"
+    if "Too many authentication failures" in e:
+        return "认证尝试次数过多：agent 里的密钥太多，试试加 -o IdentitiesOnly=yes 或减少 agent 中的密钥"
+    first = (e.strip() or out.strip() or "未知错误（退出码 %s）" % rc)
+    return first.splitlines()[0]
+
+
+# ---------------------------------------------------------------------------
+# 密钥生成 / 读取
+# ---------------------------------------------------------------------------
+
+def key_paths(name):
+    return os.path.join(KEYS_DIR, name), os.path.join(KEYS_DIR, name + ".pub")
+
+
+def gen_keypair(name, key_type="ed25519", comment=None, passphrase=""):
+    priv, pub = key_paths(name)
+    if os.path.exists(priv):
+        die("密钥已存在：%s\n  如需重建，请先执行：sshbind remove %s" % (priv, name))
+    comment = comment or ("sshbind:%s@%s" % (name, os.uname().nodename))
+    cmd = ["ssh-keygen", "-t", key_type, "-f", priv, "-N", passphrase, "-C", comment, "-q"]
+    if key_type == "rsa":
+        cmd += ["-b", "4096"]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        die("ssh-keygen 失败：%s" % proc.stderr.decode("utf-8", "replace").strip())
+    os.chmod(priv, 0o600)
+    os.chmod(pub, 0o644)
+    info("已生成密钥对：%s" % priv)
+    return priv, pub
+
+
+def read_pubkey_for(keyfile):
+    """读取公钥；若 .pub 不存在则尝试从私钥推导（加密私钥会失败）。"""
+    keyfile = os.path.expanduser(keyfile)
+    pub = keyfile + ".pub"
+    if os.path.exists(pub):
+        with open(pub, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    proc = subprocess.run(["ssh-keygen", "-y", "-f", keyfile],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          stdin=subprocess.DEVNULL)
+    if proc.returncode == 0:
+        return proc.stdout.decode("utf-8", "replace").strip()
+    return None
+
+
+def read_pubkey(name):
+    priv, _ = key_paths(name)
+    pubkey = read_pubkey_for(priv)
+    if not pubkey:
+        die("找不到公钥：%s.pub\n  若是加密私钥，请手动提供公钥文件" % priv)
+    return pubkey
+
+
+def fingerprint_of(pubkey_line):
+    """从公钥内容算指纹，不依赖本地文件。"""
+    proc = subprocess.run(["ssh-keygen", "-lf", "-"],
+                          input=pubkey_line.encode("utf-8"),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        return "?"
+    out = proc.stdout.decode("utf-8", "replace").strip()
+    parts = out.split()
+    return parts[1] if len(parts) > 1 else out
+
+
+def find_certificate(keyfile):
+    """自动发现 <key>-cert.pub（OpenSSH SSH 证书）。"""
+    cand = os.path.expanduser(keyfile) + "-cert.pub"
+    return cand if os.path.exists(cand) else None
+
+
+# ---------------------------------------------------------------------------
+# 远端操作
+# ---------------------------------------------------------------------------
+
+# 注意：脚本必须「写入后回读校验」再报成功。
+# 早期版本没有校验，导致在家目录不可写的服务器（如极空间/NAS）上
+# mkdir 失败却仍然打印 SSHBIND_ADDED，谎报成功。
+REMOTE_INSTALL = (
+    "set -e; umask 077; "
+    'if [ -z "$HOME" ] || [ ! -d "$HOME" ]; then echo "SSHBIND_NO_HOME"; exit 1; fi; '
+    "mkdir -p ~/.ssh; chmod 700 ~/.ssh; "
+    "touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; "
+    'KEY="$(cat)"; '
+    'if [ -z "$KEY" ]; then echo "SSHBIND_EMPTY_KEY"; exit 1; fi; '
+    'if grep -qxF "$KEY" ~/.ssh/authorized_keys 2>/dev/null; then echo "SSHBIND_ALREADY"; '
+    "else "
+    '  printf \'%s\\n\' "$KEY" >> ~/.ssh/authorized_keys || { echo "SSHBIND_WRITE_FAILED"; exit 1; }; '
+    '  grep -qxF "$KEY" ~/.ssh/authorized_keys || { echo "SSHBIND_WRITE_FAILED"; exit 1; }; '
+    '  echo "SSHBIND_ADDED"; '
+    "fi"
+)
+
+REMOTE_UNINSTALL = (
+    "set -e; "
+    'KEY="$(cat)"; '
+    'if [ ! -f ~/.ssh/authorized_keys ]; then echo "SSHBIND_NOFILE"; exit 0; fi; '
+    'if ! grep -qxF "$KEY" ~/.ssh/authorized_keys; then echo "SSHBIND_NOTFOUND"; exit 0; fi; '
+    'TMP="$(mktemp)"; grep -vxF "$KEY" ~/.ssh/authorized_keys > "$TMP"; '
+    'cat "$TMP" > ~/.ssh/authorized_keys; rm -f "$TMP"; '
+    'chmod 600 ~/.ssh/authorized_keys; '
+    # 回读校验：确认这条公钥真的没了
+    'if grep -qxF "$KEY" ~/.ssh/authorized_keys; then echo "SSHBIND_REMOVE_FAILED"; exit 1; fi; '
+    'echo "SSHBIND_REMOVED"'
+)
+
+
+def install_pubkey(host, user, port, auth, pubkey, restrict=False):
+    """用给定的认证方式登录一次，把公钥追加到远端 authorized_keys。"""
+    key_line = pubkey
+    if restrict:
+        parts = pubkey.split(None, 2)
+        key_line = ("restrict " + pubkey) if len(parts) < 3 else \
+                   ("restrict %s %s %s" % (parts[0], parts[1], parts[2]))
+
+    auth_opts, handle = auth_ssh_opts(auth)
+    cmd = ssh_base(host, user, port) + auth_opts + \
+          ["%s@%s" % (user, host), REMOTE_INSTALL]
+
+    if handle:
+        with handle:
+            rc, out, err = run_ssh(cmd, secret_handle=handle, stdin_data=key_line)
+    else:
+        rc, out, err = run_ssh(cmd, stdin_data=key_line)
+
+    if "SSHBIND_ADDED" in out:
+        return True, "公钥已写入远端 authorized_keys"
+    if "SSHBIND_ALREADY" in out:
+        return True, "公钥此前已存在于远端（跳过重复写入）"
+    if "SSHBIND_NO_HOME" in out:
+        return False, ("服务器上该用户的家目录不存在或不可写，无法创建 ~/.ssh。\n"
+                       "     sshd 因此读不到 authorized_keys → 密钥登录不可用。\n"
+                       "     常见于 NAS / 精简系统，需要在服务器端修复家目录。")
+    if "SSHBIND_WRITE_FAILED" in out:
+        return False, "写入远端 authorized_keys 失败（家目录不可写或磁盘只读）"
+    if "SSHBIND_EMPTY_KEY" in out:
+        return False, "公钥内容为空，已中止"
+    return False, classify_ssh_error(rc, err, out)
+
+
+def uninstall_pubkey(host, user, port, keyfile, pubkey, certificate=None):
+    """用已有密钥登录，从远端 authorized_keys 移除对应公钥行。"""
+    cmd = ssh_with_key(host, user, port, keyfile, certificate) + [REMOTE_UNINSTALL]
+    rc, out, err = run_ssh(cmd, stdin_data=pubkey)
+    if "SSHBIND_REMOVED" in out:
+        return True, "已从远端 authorized_keys 移除公钥"
+    if "SSHBIND_NOTFOUND" in out:
+        return True, "远端本来就没有这条公钥"
+    if "SSHBIND_NOFILE" in out:
+        return True, "远端没有 authorized_keys 文件"
+    if "SSHBIND_REMOVE_FAILED" in out:
+        return False, "远端 authorized_keys 未能成功更新（公钥可能仍在服务器上）"
+    return False, "无法连接远端：%s" % classify_ssh_error(rc, err, out)
+
+
+def test_connection(host, user, port, keyfile, certificate=None, timeout=20):
+    """只用密钥认证做一次真实连通性测试。"""
+    cmd = ssh_with_key(host, user, port, keyfile, certificate) + \
+          ["echo SSHBIND_OK && hostname && whoami"]
+    rc, out, err = run_ssh(cmd, timeout=timeout)
+    if rc == 0 and "SSHBIND_OK" in out:
+        lines = [l for l in out.strip().splitlines() if l and l != "SSHBIND_OK"]
+        return True, lines
+    return False, [classify_ssh_error(rc, err, out, timeout)]
+
+
+# ---------------------------------------------------------------------------
+# ~/.ssh/config 托管块
+# ---------------------------------------------------------------------------
+
+def _strip_block(text):
+    out, skip = [], False
+    for line in text.splitlines(True):
+        stripped = line.strip()
+        if stripped.startswith("# >>> sshbind managed block"):
+            skip = True
+            continue
+        if stripped.startswith("# <<< sshbind managed block"):
+            skip = False
+            continue
+        if not skip:
+            out.append(line)
+    return "".join(out)
+
+
+def render_block(servers):
+    if not servers:
+        return ""
+    parts = [BLOCK_BEGIN]
+    for name in sorted(servers):
+        s = servers[name]
+        parts.append("")
+        parts.append("Host %s" % s["name"])
+        parts.append("    HostName %s" % s["host"])
+        parts.append("    User %s" % s["user"])
+        parts.append("    Port %s" % s["port"])
+        parts.append("    IdentityFile %s" % s["key"])
+        if s.get("certificate"):
+            parts.append("    CertificateFile %s" % s["certificate"])
+        parts.append("    IdentitiesOnly yes")
+        parts.append("    ServerAliveInterval 30")
+        parts.append("    ServerAliveCountMax 3")
+    parts.append("")
+    parts.append(BLOCK_END)
+    return "\n".join(parts) + "\n"
+
+
+def write_ssh_config(servers):
+    ensure_dirs()
+    existing = ""
+    if os.path.exists(SSH_CONFIG):
+        with open(SSH_CONFIG, "r", encoding="utf-8") as f:
+            existing = f.read()
+        try:
+            shutil.copy2(SSH_CONFIG, SSH_CONFIG + ".sshbind.bak")
+        except OSError:
+            pass
+
+    body = _strip_block(existing).rstrip("\n")
+    block = render_block(servers)
+    new_content = (body + "\n\n" + block) if block else (body + "\n" if body else "")
+    if new_content == existing:
+        return False
+    tmp = SSH_CONFIG + ".sshbind.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(new_content)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, SSH_CONFIG)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# 认证参数解析（add / adopt 共用）
+# ---------------------------------------------------------------------------
+
+def resolve_auth(args, for_what="推送公钥"):
+    """
+    根据命令行参数决定认证方式与凭据。
+    优先级：--agent > --identity > --password / --password-stdin > 交互式提示密码
+    """
+    if getattr(args, "agent", False) and getattr(args, "identity", None):
+        die("--agent 与 --identity 不能同时使用，请二选一")
+
+    if getattr(args, "agent", False):
+        return make_auth(AUTH_AGENT)
+
+    if getattr(args, "identity", None):
+        identities = []
+        for f in args.identity:
+            p = os.path.expanduser(f)
+            if not os.path.exists(p):
+                die("找不到私钥文件：%s" % p)
+            identities.append(p)
+        passphrase = None
+        need_prompt = any(key_is_encrypted(p) for p in identities)
+        if getattr(args, "identity_passphrase_stdin", False):
+            passphrase = sys.stdin.readline().rstrip("\n")
+            if not passphrase:
+                die("从 stdin 读到的私钥口令为空")
+        elif need_prompt:
+            if not sys.stdin.isatty():
+                die("私钥 %s 带口令，但当前不是交互式终端。\n"
+                    "  请用 --identity-passphrase-stdin 从管道传入口令。"
+                    % os.path.basename(identities[0]))
+            try:
+                passphrase = getpass.getpass("  私钥口令（输入时不可见）: ")
+            except (KeyboardInterrupt, EOFError):
+                print()
+                die("已取消")
+            if not passphrase:
+                die("私钥口令为空，已取消")
+        return make_auth(AUTH_KEY, identities=identities, passphrase=passphrase)
+
+    # 密码模式
+    if getattr(args, "password_stdin", False):
+        password = sys.stdin.readline().rstrip("\n")
+        if not password:
+            die("从 stdin 读到的密码为空")
+        return make_auth(AUTH_PASSWORD, password=password)
+
+    if not sys.stdin.isatty():
+        die("当前不是交互式终端，无法提示输入密码。请改用：\n"
+            "   --password-stdin          从管道读密码\n"
+            "   --identity ~/.ssh/id_rsa  用已有私钥认证\n"
+            "   --agent                   用 ssh-agent 认证")
+    try:
+        password = getpass.getpass("  密码（输入时不可见）: ")
+    except (KeyboardInterrupt, EOFError):
+        print()
+        die("已取消")
+    if not password:
+        die("密码为空，已取消")
+    return make_auth(AUTH_PASSWORD, password=password)
+
+
+def validate_name(name):
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name):
+        die("名称只能包含字母、数字、点、下划线、连字符，且不能以符号开头：%s" % name)
+    if name in ("*", "?", "!"):
+        die("名称非法：%s" % name)
+
+
+# ---------------------------------------------------------------------------
+# 子命令
+# ---------------------------------------------------------------------------
+
+def cmd_add(args):
+    name = args.name
+    validate_name(name)
+
+    state = load_state()
+    if name in state["servers"] and not args.force:
+        die("名称已存在：%s\n  换个名字，或加 --force 覆盖（会重建密钥）" % name)
+
+    host, user, port = args.host, args.user, args.port
+
+    print()
+    print("  绑定服务器  %s" % bold("%s@%s:%s" % (user, host, port)))
+    print("  %s" % ("-" * 46))
+
+    # 1) 认证凭据
+    auth = resolve_auth(args)
+    print("  首次认证方式：%s" % auth_label(auth))
+    print()
+
+    # 2) 生成专属密钥
+    if args.force and name in state["servers"]:
+        old = state["servers"].pop(name)
+        if old.get("source") != "adopted":
+            for p in (old["key"], old["key"] + ".pub"):
+                if os.path.exists(p):
+                    os.remove(p)
+        info("已移除旧的 %s 记录" % name)
+
+    priv, pub = gen_keypair(name, key_type=args.key_type,
+                            passphrase=args.key_passphrase or "")
+    pubkey = read_pubkey(name)
+    fp = fingerprint_of(pubkey)
+    certificate = find_certificate(priv)
+    if certificate:
+        info("检测到 SSH 证书：%s" % os.path.basename(certificate))
+
+    # 3) 推送公钥
+    info("正在用%s登录并把公钥写入远端 …" % auth_label(auth))
+    success, msg = install_pubkey(host, user, port, auth, pubkey,
+                                  restrict=args.restrict)
+    auth = None   # 尽快释放凭据
+    if not success:
+        warn("公钥推送失败：%s" % msg)
+        print()
+        print("  别急，密钥已经生成好了。你可以手动完成最后一步：")
+        print()
+        print("    1. 执行下面命令拿到公钥：")
+        print("         sshbind pubkey %s" % name)
+        print("    2. 登录服务器，把公钥整行粘贴进 ~/.ssh/authorized_keys")
+        print()
+        print("  %s" % (C_DIM + "（有些服务器禁用了密码登录，只能这样手动加）" + C_OFF))
+        print()
+        if not ask_yes_no("  要保留这把已生成的密钥吗？[Y/n] ", default=True):
+            for p in (priv, pub):
+                if os.path.exists(p):
+                    os.remove(p)
+            die("已清理，未做任何改动")
+        state["servers"][name] = _record(name, host, user, port, priv, fp,
+                                         args.key_type, args.restrict,
+                                         certificate, "generated", installed=False)
+        save_state(state)
+        write_ssh_config(state["servers"])
+        warn("已记录为「待手动安装」状态，装好后执行 sshbind test %s 验证" % name)
+        return 1
+
+    ok(msg)
+
+    # 4) 真实连通性验证（只用新密钥，禁密码回退）
+    info("验证免密登录 …")
+    alive, details = test_connection(host, user, port, priv, certificate)
+    if alive:
+        ok("免密登录成功 — %s" % " / ".join(details))
+    else:
+        warn("公钥已写入，但免密验证未通过：%s" % (details[0] if details else "未知"))
+        warn("可稍后再试：sshbind test %s" % name)
+
+    # 5) 记录
+    state["servers"][name] = _record(name, host, user, port, priv, fp,
+                                     args.key_type, args.restrict,
+                                     certificate, "generated", installed=True)
+    save_state(state)
+    write_ssh_config(state["servers"])
+
+    print()
+    ok("已绑定 %s" % bold(name))
+    print()
+    print("  直接连接：   %s" % bold("ssh %s" % name))
+    print("  执行命令：   %s" % bold('ssh %s "uptime"' % name))
+    print("  指纹：       %s" % fp)
+    return 0
+
+
+def _record(name, host, user, port, key, fp, key_type, restrict,
+            certificate, source, installed):
+    return {
+        "name": name, "host": host, "user": user, "port": port,
+        "key": key, "fingerprint": fp, "key_type": key_type,
+        "restrict": bool(restrict), "certificate": certificate,
+        "source": source, "installed": bool(installed),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def cmd_adopt(args):
+    """纳管已有密钥：不生成、不推送，只登记并验证。"""
+    # 契约 §8.2 要求 add/adopt 都有 --password-stdin（控制台统一入口）。adopt 只用密钥
+    # 验证、不需要密码，这里读掉首行避免调用方的管道阻塞，不使用该值。
+    if getattr(args, "password_stdin", False):
+        try:
+            sys.stdin.readline()
+        except (OSError, ValueError):
+            pass
+    name = args.name
+    validate_name(name)
+
+    state = load_state()
+    if name in state["servers"] and not args.force:
+        die("名称已存在：%s\n  换个名字，或加 --force 覆盖" % name)
+
+    keyfile = os.path.expanduser(args.identity[0] if args.identity else "")
+    if not keyfile or not os.path.exists(keyfile):
+        die("必须用 --identity 指定一个已存在的私钥文件")
+    # 不擅自改动你的文件权限，只提示（私钥过宽会被 ssh 拒绝）
+    try:
+        mode = os.stat(keyfile).st_mode & 0o777
+        if mode & 0o077:
+            warn("私钥权限过宽（%o），ssh 可能会拒绝使用：%s" % (mode, keyfile))
+            warn("建议执行：chmod 600 %s" % keyfile)
+    except OSError:
+        pass
+
+    certificate = os.path.expanduser(args.certificate) if args.certificate \
+        else find_certificate(keyfile)
+    if certificate and not os.path.exists(certificate):
+        die("找不到证书文件：%s" % certificate)
+
+    host, user, port = args.host, args.user, args.port
+    print()
+    print("  纳管已有密钥  %s" % bold("%s@%s:%s" % (user, host, port)))
+    print("  %s" % ("-" * 46))
+    print("  私钥：  %s" % keyfile)
+    if certificate:
+        print("  证书：  %s" % certificate)
+    print()
+
+    pubkey = read_pubkey_for(keyfile)
+    fp = fingerprint_of(pubkey) if pubkey else "?"
+
+    info("验证这把密钥能否登录 …")
+    alive, details = test_connection(host, user, port, keyfile, certificate)
+    if alive:
+        ok("验证通过 — %s" % " / ".join(details))
+    else:
+        warn("验证未通过：%s" % (details[0] if details else "未知"))
+        if not args.force:
+            print()
+            print("  可能原因：密钥不对、服务器没配这把公钥、或需要跳板机。")
+            print("  如果你确定要登记，加 --force 跳过验证。")
+            print()
+            if not ask_yes_no("  仍要登记吗？[y/N] ", default=False):
+                print("  已取消，未做任何改动")
+                return 1
+
+    state["servers"][name] = _record(name, host, user, port, keyfile, fp,
+                                     "existing", False, certificate,
+                                     "adopted", installed=bool(alive))
+    save_state(state)
+    write_ssh_config(state["servers"])
+
+    print()
+    ok("已纳管 %s" % bold(name))
+    print()
+    print("  直接连接：   %s" % bold("ssh %s" % name))
+    print("  指纹：       %s" % fp)
+    print()
+    print("  %s" % (C_DIM + "注意：这是你原有的密钥，sshbind remove 默认不会删除它" + C_OFF))
+    return 0
+
+
+def cmd_list(args):
+    state = load_state()
+    servers = state["servers"]
+
+    # agent 友好：结构化输出，便于可靠解析（不要靠截屏幕文本）
+    if getattr(args, "json", False):
+        out = []
+        for name in sorted(servers):
+            s = servers[name]
+            key_ok = os.path.exists(s["key"])
+            out.append({
+                "name": name,
+                "host": s["host"],
+                "user": s["user"],
+                "port": s["port"],
+                "source": s.get("source", "generated"),
+                "key_path": s["key"],
+                "key_exists": key_ok,
+                "fingerprint": s.get("fingerprint"),
+                "installed": bool(s.get("installed", True)),
+                "usable": bool(key_ok and s.get("installed", True)),
+            })
+        print(json.dumps({"count": len(out), "servers": out},
+                         ensure_ascii=False, indent=2))
+        return 0
+
+    if not servers:
+        print("还没有绑定任何服务器。用这条命令开始：")
+        print("    sshbind add myserver --host 1.2.3.4 --user root")
+        print("    sshbind add myserver --host 1.2.3.4 --identity ~/.ssh/id_rsa")
+        return 0
+
+    rows = []
+    for name in sorted(servers):
+        s = servers[name]
+        rows.append((name,
+                     "%s@%s:%s" % (s["user"], s["host"], s["port"]),
+                     os.path.exists(s["key"]),
+                     s.get("source", "generated"),
+                     s.get("installed", True)))
+
+    w = max(max(len(r[0]) for r in rows), 4)
+    wh = max(len(r[1]) for r in rows)
+    print()
+    print("  %-*s  %-*s  %-8s  %-6s  %s" % (w, "名称", wh, "目标", "密钥", "来源", "状态"))
+    print("  %s" % ("-" * (w + wh + 32)))
+    for name, target, key_ok, source, installed in rows:
+        src = "纳管" if source == "adopted" else "生成"
+        if not key_ok:
+            status = "密钥丢失"
+        elif not installed:
+            status = "待手动安装"
+        else:
+            status = "已绑定"
+        print("  %-*s  %-*s  %-8s  %-6s  %s" % (
+            w, name, wh, target, "存在" if key_ok else "缺失", src, status))
+    print()
+    print("  %s" % (C_DIM + "共 %d 台。详情：sshbind show <名称>；测试：sshbind test --all" % len(rows) + C_OFF))
+    return 0
+
+
+def cmd_show(args):
+    state = load_state()
+    s = state["servers"].get(args.name)
+    if not s:
+        die("没有名为 %s 的绑定。执行 sshbind list 查看全部" % args.name)
+    print()
+    for k, label in (("name", "名称"), ("host", "地址"), ("user", "用户"),
+                     ("port", "端口"), ("key", "私钥"), ("fingerprint", "指纹"),
+                     ("key_type", "算法"), ("created_at", "创建时间")):
+        print("  %-10s %s" % (label, s.get(k, "-")))
+    print("  %-10s %s" % ("来源", "纳管已有密钥" if s.get("source") == "adopted" else "sshbind 生成"))
+    print("  %-10s %s" % ("证书", s.get("certificate") or "无"))
+    print("  %-10s %s" % ("私钥存在", "是" if os.path.exists(s["key"]) else "否"))
+    print("  %-10s %s" % ("限制模式", "是 (restrict)" if s.get("restrict") else "否"))
+    print()
+    print("  连接命令：  ssh %s" % args.name)
+    print("  查看公钥：  sshbind pubkey %s" % args.name)
+    print()
+    return 0
+
+
+def cmd_pubkey(args):
+    state = load_state()
+    s = state["servers"].get(args.name)
+    if s and s.get("source") == "adopted":
+        pubkey = read_pubkey_for(s["key"])
+        if not pubkey:
+            die("无法从私钥推导公钥（可能是加密私钥，且没有 .pub 文件）")
+        print(pubkey)
+        return 0
+    print(read_pubkey(args.name))
+    return 0
+
+
+def cmd_test(args):
+    state = load_state()
+    servers = state["servers"]
+    targets = sorted(servers) if args.all else [args.name]
+    if not targets or targets == [None]:
+        die("请指定名称，或用 --all 测试全部")
+    bad = 0
+    for name in targets:
+        s = servers.get(name)
+        if not s:
+            print("  %-16s %s" % (name, "未找到该绑定"))
+            bad += 1
+            continue
+        if not os.path.exists(s["key"]):
+            print("  %-16s %s" % (name, "私钥文件缺失，无法测试"))
+            bad += 1
+            continue
+        alive, details = test_connection(s["host"], s["user"], s["port"],
+                                         s["key"], s.get("certificate"))
+        if alive:
+            head = details[0] if details else ""
+            tail = details[1] if len(details) > 1 else ""
+            print("  %-16s 连通  %s%s" % (name, head, (" (%s)" % tail) if tail else ""))
+        else:
+            print("  %-16s 失败  %s" % (name, details[0] if details else "未知"))
+            bad += 1
+    print()
+    if bad:
+        print("  %s" % (C_WARN + "%d/%d 台不可用" % (bad, len(targets)) + C_OFF))
+        return 1
+    print("  %s" % (C_OK + "全部 %d 台连通正常" % len(targets) + C_OFF))
+    return 0
+
+
+def cmd_remove(args):
+    state = load_state()
+    s = state["servers"].get(args.name)
+    if not s:
+        die("没有名为 %s 的绑定" % args.name)
+
+    adopted = s.get("source") == "adopted"
+    do_revoke = not args.no_revoke
+    delete_key = args.delete_key or (not adopted and not args.keep_key)
+
+    print()
+    print("  即将解绑  %s  (%s@%s:%s)" % (bold(args.name), s["user"], s["host"], s["port"]))
+    print("  %s" % ("-" * 46))
+    if do_revoke:
+        print("   · 从远端 ~/.ssh/authorized_keys 移除对应公钥行")
+    else:
+        print("   · 跳过远端清理（--no-revoke）")
+    print("   · 从 ~/.ssh/config 移除该 Host 条目")
+    print("   · 删除本地密钥文件" if delete_key else "   · 保留本地密钥文件 %s" % s["key"])
+    if adopted and not args.delete_key:
+        print()
+        print("  %s" % (C_DIM + "ℹ️  这是 adopt 纳管的已有密钥，默认保留不删" + C_OFF))
+    print()
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            die("非交互式终端，请加 --yes 确认")
+        ans = input("  确认解绑？输入 yes 继续: ").strip().lower()
+        if ans != "yes":
+            print("  已取消，未做任何改动")
+            return 0
+
+    if do_revoke and os.path.exists(s["key"]):
+        info("正在从远端移除公钥 …")
+        pubkey = read_pubkey_for(s["key"])
+        if not pubkey:
+            warn("无法读取公钥（加密私钥且无 .pub），跳过远端清理")
+        else:
+            remote_ok, remote_msg = uninstall_pubkey(
+                s["host"], s["user"], s["port"], s["key"], pubkey,
+                s.get("certificate"))
+            if remote_ok:
+                ok(remote_msg)
+            else:
+                warn(remote_msg)
+                if not args.force:
+                    print()
+                    print("  远端清理失败，服务器上仍保留着这把公钥（等于留了一把能登录的钥匙）。")
+                    print("  建议你手动登录删掉它；确认无所谓可加 --force 继续。")
+                    print()
+                    if not ask_yes_no("  仍要继续？[y/N] ", default=False):
+                        print("  已取消")
+                        return 1
+    elif do_revoke:
+        warn("本地私钥不存在，跳过远端清理")
+
+    if delete_key:
+        for p in (s["key"], s["key"] + ".pub"):
+            if os.path.exists(p):
+                os.remove(p)
+        info("本地密钥已删除")
+    else:
+        info("本地密钥已保留：%s" % s["key"])
+
+    state["servers"].pop(args.name, None)
+    save_state(state)
+    write_ssh_config(state["servers"])
+    ok("已解绑 %s" % args.name)
+    print()
+    return 0
+
+
+def cmd_import(args):
+    source = args.source.lower()
+    if source not in ("finalshell", "fs"):
+        die("暂不支持的来源：%s\n  目前支持：finalshell" % args.source)
+
+    base_dir = find_finalshell_dir(args.dir)
+    if not base_dir:
+        die("找不到 FinalShell 配置目录。\n  已尝试：\n    %s\n"
+            "  可以用 --dir 手动指定。" % "\n    ".join(FINALSSHELL_DIRS))
+
+    conns, keyed = parse_finalshell(base_dir)
+    if not conns:
+        die("在 %s 里没有找到任何连接配置" % base_dir)
+
+    if args.only:
+        wanted = set(x.strip() for x in args.only.split(",") if x.strip())
+        conns = [c for c in conns if c["name"] in wanted or c["host"] in wanted]
+        if not conns:
+            die("--only 没有匹配到任何连接")
+
+    renames = {}
+    for pair in (args.rename or []):
+        if "=" not in pair:
+            die("--rename 需要 OLD=NEW 格式，例如 --rename '混混pay=pay'")
+        k, v = pair.split("=", 1)
+        renames[k.strip()] = v.strip()
+
+    state = load_state()
+    taken = set(state["servers"].keys())
+    planned = []
+    for c in conns:
+        alias = make_alias(renames.get(c["name"], c["name"]), c["host"], taken)
+        taken.add(alias)
+        planned.append((alias, c))
+
+    print()
+    print("  来源：%s" % base_dir)
+    print("  找到 %d 个连接%s" % (len(planned),
+                                 ("（其中 %d 个是密钥型，暂不自动导入）" % keyed) if keyed else ""))
+    print("  %s" % ("-" * 68))
+    print("  %-18s %-24s %-16s %s" % ("SSH 别名", "服务器", "用户名", "备注"))
+    print("  %s" % ("-" * 68))
+    for alias, c in planned:
+        note = "密钥型，跳过" if c["is_key"] else ("有密码" if c["password_enc"] else "无密码")
+        orig = "" if alias == c["name"] else "（原名 %s）" % c["name"]
+        print("  %-18s %-24s %-16s %s%s" % (
+            alias, "%s:%s" % (c["host"], c["port"]), c["user"], note, orig))
+    print()
+
+    if not args.with_passwords:
+        print("  以上仅为预览，尚未做任何改动。")
+        print()
+        print("  要真正导入并完成免密绑定（会解密 FinalShell 保存的密码，仅用于登录一次）：")
+        print("      %s" % bold("sshbind import finalshell --with-passwords"))
+        print()
+        print("  想改别名：%s" % "sshbind import finalshell --rename '原名=新名'")
+        print("  只导入部分：%s" % "sshbind import finalshell --only 名称1,名称2")
+        print()
+        return 0
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            die("非交互式终端，请加 --yes 确认")
+        ans = input("  开始导入？会对每台服务器发起一次真实连接。输入 yes 继续: ").strip().lower()
+        if ans != "yes":
+            print("  已取消，未做任何改动")
+            return 0
+
+    print()
+    stats = {"bound": 0, "pending": 0, "skipped": 0}
+    for alias, c in planned:
+        tag = "%-18s" % alias
+        if c["is_key"]:
+            warn("%s 跳过：密钥型连接，请用 sshbind adopt 手动纳管" % tag)
+            stats["skipped"] += 1
+            continue
+        try:
+            password = finalshell_decode_password(c["password_enc"])
+        except Exception as e:
+            warn("%s 跳过：密码解密失败（%s）" % (tag, e))
+            stats["skipped"] += 1
+            continue
+        if not password:
+            warn("%s 跳过：FinalShell 里没有保存密码" % tag)
+            stats["skipped"] += 1
+            continue
+
+        priv, pub = gen_keypair(alias, key_type=args.key_type)
+        pubkey = read_pubkey(alias)
+        fp = fingerprint_of(pubkey)
+
+        auth = make_auth(AUTH_PASSWORD, password=password)
+        del password
+        pushed, msg = install_pubkey(c["host"], c["user"], c["port"], auth,
+                                     pubkey, restrict=args.restrict)
+        auth = None
+
+        if pushed:
+            alive, details = test_connection(c["host"], c["user"], c["port"], priv)
+            state["servers"][alias] = _record(
+                alias, c["host"], c["user"], c["port"], priv, fp,
+                args.key_type, args.restrict, None, "generated", installed=True)
+            save_state(state)
+            if alive:
+                ok("%s ✅ 已绑定  %s@%s:%s" % (tag, c["user"], c["host"], c["port"]))
+                stats["bound"] += 1
+            else:
+                warn("%s 公钥已推送但免密验证未通过：%s" % (tag, details[0] if details else "?"))
+                stats["pending"] += 1
+        else:
+            warn("%s 绑定失败：%s" % (tag, msg))
+            warn("%s   → 私钥已生成保留，可手动加公钥：sshbind pubkey %s" % (" " * 18, alias))
+            state["servers"][alias] = _record(
+                alias, c["host"], c["user"], c["port"], priv, fp,
+                args.key_type, args.restrict, None, "generated", installed=False)
+            save_state(state)
+            stats["pending"] += 1
+
+    write_ssh_config(state["servers"])
+    print()
+    print("  完成：成功 %d，待处理 %d，跳过 %d" % (
+        stats["bound"], stats["pending"], stats["skipped"]))
+    if stats["bound"]:
+        print("  试试：  ssh %s" % planned[0][0])
+    print()
+    return 0 if stats["bound"] or not stats["pending"] else 1
+
+
+# ---------------------------------------------------------------------------
+# bindconsole：策略闸门 + 本机 Web 控制台（CONTRACT bindconsole §3/§4/§8）
+# ---------------------------------------------------------------------------
+
+BINDCONSOLE_INSTALL_CMD = "curl -fsSL https://github.com/isle24/bindkit/releases/latest/download/install.sh | bash"
+
+
+def die_fail_closed(message, code="STATE_CORRUPT", hint=None):
+    """fail-closed 拒绝：人类可读输出必须打印稳定的 error.code（契约 §8.1.1）。"""
+    sys.stderr.write("ERROR %s\n" % message)
+    sys.stderr.write("     code: %s\n" % code)
+    if hint:
+        sys.stderr.write("     %s\n" % hint)
+    sys.stderr.flush()
+    sys.exit(1)
+_POLICY_MODULE = None
+SSH_APPROVAL_RC = {"AUTHZ_DENIED": 5, "SUDO_DENIED": 5, "APPROVAL_REQUIRED": 6}
+
+
+def bindconsole_home():
+    return (os.environ.get("BINDCONSOLE_HOME")
+            or os.path.join(os.path.expanduser("~"), ".bindconsole"))
+
+
+def bindconsole_lib():
+    return os.path.join(bindconsole_home(), "lib")
+
+
+def load_policy_module(required=False):
+    """从 ~/.bindconsole/lib 加载策略模块（单一真源）。
+
+    fail-closed 边界（CONTRACT §8.1.1）：
+      * policy.json 不存在 + 模块缺失 → 返回 None（allow，保持改造前行为）
+      * policy.json 存在   + 模块缺失 → 直接拒绝并给安装命令（不能静默放行）
+    """
+    global _POLICY_MODULE
+    if _POLICY_MODULE is not None:
+        return _POLICY_MODULE
+    lib = bindconsole_lib()
+    if os.path.isdir(lib) and lib not in sys.path:
+        sys.path.insert(0, lib)
+    try:
+        import bindkit_policy as mod
+        _POLICY_MODULE = mod
+        return mod
+    except Exception as e:                     # noqa: BLE001
+        if required:
+            die("找不到 bindconsole 内核：%s（%s）\n  先安装：%s"
+                % (lib, e, BINDCONSOLE_INSTALL_CMD))
+        policy_path = os.path.join(os.path.expanduser("~"), ".ssh", "sshbind",
+                                   "policy.json")
+        if os.path.exists(policy_path):
+            # 人类输出带 code=STATE_CORRUPT（dbbind 同款），机器/人都能稳定判定
+            die_fail_closed(
+                "策略文件存在但 bindconsole 内核缺失/无法加载，已按 fail-closed 拒绝。\n"
+                "  policy: %s\n  重新安装内核：%s\n  （加载错误：%s）"
+                % (policy_path, BINDCONSOLE_INSTALL_CMD, e))
+        return None
+
+
+def _policy_gate_ssh(alias, command):
+    mod = load_policy_module()
+    if mod is None:
+        return None
+    try:
+        return mod.gate_ssh(alias, command, requester="ai")
+    except Exception:                          # noqa: BLE001 —— 闸门绝不抛给主流程
+        return {"decision": "deny", "code": "AUTHZ_DENIED",
+                "message": "策略校验内部错误，已按 fail-closed 拒绝",
+                "hint": "查看 ~/.bindconsole/audit.log"}
+
+
+def _emit_gate_ssh(args, gate, command):
+    """输出闸门拒绝/待审批并返回退出码（CONTRACT §5.1 ssh 结构）。"""
+    code = gate.get("code") or "AUTHZ_DENIED"
+    rc = SSH_APPROVAL_RC.get(code, 1)
+    err = {"code": code, "message": gate.get("message") or "授权校验未通过"}
+    for key in ("hint", "request_id", "expires_at"):
+        if gate.get(key):
+            err[key] = gate[key]
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "ok": False, "blocked": True, "alias": args.name, "command": command,
+            "error": err, "exit_code": rc, "stdout": "", "stderr": "", "duration_ms": 0,
+        }, ensure_ascii=False, indent=2))
+        return rc
+    sys.stdout.flush()
+    print("%s❌ %s%s" % (C_ERR, err["message"], C_OFF) if _tty() else "ERROR " + err["message"],
+          file=sys.stderr)
+    print("     code: %s" % code, file=sys.stderr)
+    if err.get("request_id"):
+        print("     request_id: %s" % err["request_id"], file=sys.stderr)
+    if err.get("expires_at"):
+        print("     过期时间: %s" % err["expires_at"], file=sys.stderr)
+    if err.get("hint"):
+        print("     %s" % err["hint"], file=sys.stderr)
+    sys.stderr.flush()
+    return rc
+
+
+# ---- 控制台 handlers ------------------------------------------------------
+
+_SSH_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_SSH_SUDO_MODES = ("allow", "ask", "deny")
+
+
+# 业务错误码 → HTTP 状态（内核会把 ConsoleError.status 原样映射）
+_CONSOLE_STATUS = {"NOT_FOUND": 404, "CONFLICT": 409, "ALREADY_EXISTS": 409,
+                   "INVALID_REQUEST": 400, "INVALID_PARAM": 400}
+
+
+def _console_fail(message, code="INVALID_REQUEST", hint=None):
+    """抛给内核的四类错误：优先用内核的 ConsoleError（带精确 4xx），否则 ValueError。"""
+    status = _CONSOLE_STATUS.get(code, 400)
+    try:
+        from bindkit_console import ConsoleError
+        return ConsoleError(code, message, hint, status=status)
+    except Exception:                          # noqa: BLE001
+        return ValueError(message)
+
+
+def _console_policy_module():
+    mod = load_policy_module()
+    if mod is None:
+        raise _console_fail("bindconsole 内核未安装，无法读写策略", "INTERNAL",
+                            "先执行：%s" % BINDCONSOLE_INSTALL_CMD)
+    return mod
+
+
+def _console_name(name):
+    name = str(name or "").strip()
+    if not _SSH_NAME_RE.match(name) or ".." in name:
+        raise _console_fail("服务器名不合法（只允许字母数字._-，且不能以符号开头）")
+    return name
+
+
+def _console_ssh_policy_map(mod):
+    pol = mod.read_policy("ssh")
+    return (pol.get("data") or {}) if pol.get("exists") and not pol.get("corrupt") else {}
+
+
+def _self_script():
+    """自己的可执行路径（控制台 handler 需要 subprocess 调自身 CLI）。"""
+    own = os.path.abspath(__file__)
+    if os.path.isfile(own):
+        return own
+    wh = shutil.which("sshbind")
+    if wh:
+        return wh
+    cand = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
+    if cand and os.path.isfile(cand):
+        return cand
+    return os.path.join(os.path.expanduser("~"), ".local", "bin", "sshbind")
+
+
+def _run_self(extra_args, stdin_data=None, timeout=180):
+    """参数数组调自身 CLI（不经 shell）；密码走 stdin，不进 argv。"""
+    cmd = [sys.executable, _self_script()] + list(extra_args)
+    try:
+        proc = subprocess.run(cmd, input=stdin_data.encode("utf-8") if stdin_data else None,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              stdin=None if stdin_data else subprocess.DEVNULL,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise _console_fail("操作超时（%ss）" % timeout)
+    return (proc.returncode, proc.stdout.decode("utf-8", "replace"),
+            proc.stderr.decode("utf-8", "replace"))
+
+
+def _console_ssh_item(name, srv, mod):
+    key_ok = os.path.exists(srv.get("key") or "")
+    installed = bool(srv.get("installed", True))
+    eff = mod.effective_ssh_policy(_console_ssh_policy_map(mod), name) if mod else None
+    policy_entry = (_console_ssh_policy_map(mod).get("servers", {}) or {}).get(name) or {}
+    return {
+        "name": name,
+        "host": srv.get("host"),
+        "user": srv.get("user"),
+        "port": srv.get("port"),
+        "source": srv.get("source", "generated"),
+        "installed": installed,
+        "key_exists": key_ok,
+        "usable": bool(key_ok and installed),
+        "fingerprint": srv.get("fingerprint"),
+        "created_at": srv.get("created_at"),
+        "has_key": key_ok,
+        "sudo": eff["sudo"] if eff else "ask",
+        "approval_ttl_s": eff["approval_ttl_s"] if eff else 600,
+        "note": policy_entry.get("note"),
+        "last_test": None,
+    }
+
+
+def console_ssh_list():
+    state = load_state()
+    mod = load_policy_module()
+    return {"items": [_console_ssh_item(n, state["servers"][n], mod)
+                      for n in sorted(state["servers"])]}
+
+
+def console_ssh_get(name):
+    name = _console_name(name)
+    state = load_state()
+    if name not in state["servers"]:
+        raise _console_fail("没有这个服务器：%s" % name, "NOT_FOUND")
+    return _console_ssh_item(name, state["servers"][name], load_policy_module())
+
+
+def console_ssh_create(body):
+    """创建失败且未登记服务器时，恢复本次写入前的策略。"""
+    if not isinstance(body, dict):
+        raise _console_fail("请求体必须是 JSON 对象")
+    name = _console_name(body.get("name") or body.get("alias"))
+    if name in load_state()["servers"]:
+        raise _console_fail("服务器已存在：%s" % name, "CONFLICT")
+    mod = _console_policy_module()
+    before = mod.read_policy("ssh")
+    if before.get("corrupt"):
+        raise _console_fail("SSH 策略损坏，请先修复策略", "INVALID_REQUEST")
+    try:
+        return _console_ssh_create(body)
+    except Exception:
+        # adopt 可能已保存记录、随后更新 SSH config 失败；这种情况保留密钥与策略。
+        if name not in load_state()["servers"]:
+            after = mod.read_policy("ssh")
+            if after.get("exists") and not after.get("corrupt"):
+                base = json.loads(json.dumps(before.get("data") or mod.default_policy("ssh")))
+                entry = {k: body[k] for k in ("sudo", "note", "approval_ttl_s") if k in body}
+                base.setdefault("servers", {}).setdefault(name, {}).update(entry)
+                expected = _console_clean_ssh_policy(base)
+                # 只恢复本次自己写出的版本，避免覆盖并发发生的其它策略编辑。
+                if after.get("data") == expected:
+                    if before.get("exists"):
+                        mod.write_policy("ssh", before["data"])
+                    else:
+                        os.remove(mod.tool_paths("ssh")["policy"])
+        raise
+
+
+def _console_ssh_create(body):
+    if not isinstance(body, dict):
+        raise _console_fail("请求体必须是 JSON 对象")
+    name = _console_name(body.get("name") or body.get("alias"))
+    host = str(body.get("host") or "").strip()
+    if not host:
+        raise _console_fail("必须提供 host")
+    user = str(body.get("user") or "root").strip() or "root"
+    try:
+        port = int(body.get("port") or 22)
+    except (TypeError, ValueError):
+        raise _console_fail("port 必须是整数")
+    auth = body.get("auth") if isinstance(body.get("auth"), dict) else {}
+    password = auth.get("password")
+    if password is None:
+        password = body.get("password")
+    private_key = auth.get("private_key") or body.get("private_key")
+    state = load_state()
+    if name in state["servers"]:
+        raise _console_fail("服务器已存在：%s" % name, "CONFLICT")
+    policy_entry = {key: body[key] for key in ("sudo", "note", "approval_ttl_s")
+                    if key in body}
+    if policy_entry:
+        policy_entry = _console_clean_ssh_policy(
+            {"servers": {name: policy_entry}})["servers"][name]
+        # 登记前先落策略；无效策略/写失败不能留下无授权限制的新服务器。
+        console_ssh_policy_put({"servers": {name: policy_entry}})
+
+    if isinstance(private_key, str) and private_key.strip():
+        # adopt 只登记路径：粘贴的私钥必须保留在受管目录，失败才清理本次文件。
+        os.makedirs(KEYS_DIR, mode=0o700, exist_ok=True)
+        fd, keyfile = tempfile.mkstemp(prefix=name + "-console-", dir=KEYS_DIR)
+        adopted = False
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(private_key if private_key.endswith("\n")
+                        else private_key + "\n")
+            rc, out, err = _run_self(["adopt", name, "--host", host, "--user", user,
+                                      "--port", str(port), "--identity", keyfile])
+            adopted = rc == 0
+        finally:
+            if not adopted:
+                # 非零退出也可能已经登记成功；清理前查持久状态，避免删掉在用私钥。
+                registered = any(s.get("key") == keyfile
+                                 for s in load_state()["servers"].values())
+                if not registered:
+                    try:
+                        os.remove(keyfile)
+                    except OSError:
+                        pass
+        if rc != 0:
+            raise _console_fail("导入私钥失败：%s"
+                                % (_last_line(err) or _last_line(out) or "未知错误"))
+        return {"ok": True, "name": name, "auth": "private_key"}
+
+    if isinstance(password, str) and password:
+        # 密码导入：走 add --password-stdin（密码走 stdin，不进 argv）
+        rc, out, err = _run_self(["add", name, "--host", host, "--user", user,
+                                  "--port", str(port), "--password-stdin"],
+                                 stdin_data=password + "\n")
+        if rc != 0:
+            raise _console_fail("添加失败：%s"
+                                % (_last_line(err) or _last_line(out) or "未知错误"))
+        return {"ok": True, "name": name, "auth": "password"}
+
+    raise _console_fail("需要提供 auth.password 或 auth.private_key")
+
+
+def console_ssh_update(name, body):
+    name = _console_name(name)
+    state = load_state()
+    if name not in state["servers"]:
+        raise _console_fail("没有这个服务器：%s" % name, "NOT_FOUND")
+    if not isinstance(body, dict):
+        raise _console_fail("请求体必须是 JSON 对象")
+    mod = _console_policy_module()
+    current = mod.read_policy("ssh")
+    policy = (current.get("data") or {}) if current.get("exists") and \
+        not current.get("corrupt") else mod.default_policy("ssh")
+    policy.setdefault("servers", {})
+    policy.setdefault("defaults", {})
+    entry = policy["servers"].get(name)
+    if not isinstance(entry, dict):
+        entry = {}
+    changed = []
+    sudo = body.get("sudo")
+    if sudo is not None:
+        sudo = str(sudo).lower()
+        if sudo not in _SSH_SUDO_MODES:
+            raise _console_fail("sudo 策略必须是 allow/ask/deny")
+        entry["sudo"] = sudo
+        changed.append("sudo")
+    if "note" in body:
+        note = body.get("note")
+        entry["note"] = str(note)[:200] if note else None
+        changed.append("note")
+    if "approval_ttl_s" in body and body["approval_ttl_s"] not in (None, ""):
+        try:
+            ttl = int(body["approval_ttl_s"])
+        except (TypeError, ValueError):
+            raise _console_fail("approval_ttl_s 必须是整数")
+        entry["approval_ttl_s"] = max(60, min(86400, ttl))
+        changed.append("approval_ttl_s")
+    if changed:
+        policy["servers"][name] = entry
+        mod.write_policy("ssh", policy)
+    return {"ok": True, "name": name, "changed": changed}
+
+
+def console_ssh_delete(name, body=None):
+    name = _console_name(name)
+    state = load_state()
+    if name not in state["servers"]:
+        raise _console_fail("没有这个服务器：%s" % name, "NOT_FOUND")
+    body = body if isinstance(body, dict) else {}
+    args = ["remove", name, "--yes"]
+    # 默认只删本地记录/密钥，不联网吊销（控制台删除要快且可离线）；
+    # 需要吊销远端公钥时传 {"revoke": true}
+    if not body.get("revoke"):
+        args.append("--no-revoke")
+    if body.get("delete_key"):
+        args.append("--delete-key")
+    if body.get("keep_key"):
+        args.append("--keep-key")
+    if body.get("force"):
+        args.append("--force")
+    rc, out, err = _run_self(args)
+    if rc != 0:
+        raise _console_fail("删除失败：%s" % (_last_line(err) or _last_line(out)
+                                             or "未知错误"))
+    return {"ok": True, "deleted": name, "revoked": bool(body.get("revoke"))}
+
+
+def console_ssh_test(name):
+    name = _console_name(name)
+    state = load_state()
+    srv = state["servers"].get(name)
+    if not srv:
+        raise _console_fail("没有这个服务器：%s" % name, "NOT_FOUND")
+    if not os.path.exists(srv.get("key") or ""):
+        return {"ok": False, "usable": False, "message": "私钥文件缺失，无法测试"}
+    alive, details = test_connection(srv["host"], srv["user"], srv["port"],
+                                     srv["key"], srv.get("certificate"))
+    return {"ok": bool(alive), "usable": bool(alive),
+            "message": (details[0] if details else ("连通正常" if alive else "失败")),
+            "details": details[:3]}
+
+
+def console_ssh_policy_get():
+    mod = _console_policy_module()
+    summary = mod.policy_summary("ssh")
+    summary["effective"] = {
+        alias: mod.effective_ssh_policy(summary.get("policy") or {}, alias)
+        for alias in list((summary.get("policy") or {}).get("servers", {}))
+    }
+    return summary
+
+
+def _console_clean_ssh_policy(payload):
+    if not isinstance(payload, dict):
+        raise _console_fail("策略必须是 JSON 对象")
+    out = {"version": 1, "defaults": {}, "servers": {}}
+    defaults = payload.get("defaults") if isinstance(payload.get("defaults"), dict) else {}
+    if "sudo" in defaults:
+        sudo = str(defaults.get("sudo") or "").lower()
+        if sudo not in _SSH_SUDO_MODES:
+            raise _console_fail("defaults.sudo 必须是 allow/ask/deny")
+        out["defaults"]["sudo"] = sudo
+    if "approval_ttl_s" in defaults:
+        try:
+            out["defaults"]["approval_ttl_s"] = max(60, min(86400,
+                                                           int(defaults["approval_ttl_s"])))
+        except (TypeError, ValueError):
+            raise _console_fail("approval_ttl_s 必须是整数")
+    servers = payload.get("servers") if isinstance(payload.get("servers"), dict) else {}
+    for alias, entry in servers.items():
+        alias = _console_name(alias)
+        if not isinstance(entry, dict):
+            raise _console_fail("服务器 %s 的策略必须是对象" % alias)
+        clean = {}
+        if "sudo" in entry:
+            sudo = str(entry.get("sudo") or "").lower()
+            if sudo not in _SSH_SUDO_MODES:
+                raise _console_fail("sudo 策略必须是 allow/ask/deny（%s）" % alias)
+            clean["sudo"] = sudo
+        if "approval_ttl_s" in entry and entry["approval_ttl_s"] not in (None, ""):
+            try:
+                clean["approval_ttl_s"] = max(60, min(86400, int(entry["approval_ttl_s"])))
+            except (TypeError, ValueError):
+                raise _console_fail("approval_ttl_s 必须是整数（%s）" % alias)
+        if "note" in entry:
+            clean["note"] = str(entry["note"])[:200] if entry.get("note") else None
+        out["servers"][alias] = clean
+    return out
+
+
+def console_ssh_policy_put(body):
+    mod = _console_policy_module()
+    current = mod.read_policy("ssh")
+    base = (current.get("data") or {}) if current.get("exists") and \
+        not current.get("corrupt") else mod.default_policy("ssh")
+    merged = json.loads(json.dumps(base))
+    merged.setdefault("defaults", {})
+    merged.setdefault("servers", {})
+    if isinstance(body, dict):
+        if isinstance(body.get("defaults"), dict):
+            merged["defaults"].update(body["defaults"])
+        if isinstance(body.get("servers"), dict):
+            for alias, entry in body["servers"].items():
+                if alias not in merged["servers"] or \
+                        not isinstance(merged["servers"][alias], dict):
+                    merged["servers"][alias] = {}
+                merged["servers"][alias].update(entry or {})
+        if "defaults" in body or "servers" in body:
+            clean = _console_clean_ssh_policy(merged)
+            mod.write_policy("ssh", clean)
+            return {"ok": True, "path": mod.tool_paths("ssh")["policy"]}
+    raise _console_fail("策略请求体需要包含 defaults 或 servers")
+
+
+def build_console_handlers():
+    return {
+        "resource": "servers",
+        "list": console_ssh_list,
+        "get": console_ssh_get,
+        "create": console_ssh_create,
+        "update": console_ssh_update,
+        "delete": console_ssh_delete,
+        "test": console_ssh_test,
+        "policy_get": console_ssh_policy_get,
+        "policy_put": console_ssh_policy_put,
+    }
+
+
+def _last_line(text):
+    for line in reversed((text or "").strip().splitlines()):
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+# ---- --startserver --------------------------------------------------------
+
+DEFAULT_CONSOLE_PORT = 8790
+
+
+def _parse_startserver_args(argv):
+    port = DEFAULT_CONSOLE_PORT
+    host = "127.0.0.1"
+    daemon = open_browser = False
+    saw = False
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--startserver":
+            saw = True
+        elif a == "--daemon":
+            daemon = True
+        elif a in ("--open", "--open-browser"):
+            open_browser = True
+        elif a == "--port":
+            i += 1
+            if i >= len(argv):
+                die("--port 需要一个端口号", code=2)
+            try:
+                port = int(argv[i])
+            except (TypeError, ValueError):
+                die("--port 必须是整数：%r" % argv[i], code=2)
+        elif a.startswith("--port="):
+            try:
+                port = int(a.split("=", 1)[1])
+            except (TypeError, ValueError):
+                die("--port 必须是整数：%r" % a, code=2)
+        elif a == "--host":
+            i += 1
+            if i >= len(argv):
+                die("--host 需要一个地址（默认 127.0.0.1；局域网用 0.0.0.0）", code=2)
+            host = argv[i]
+        elif a.startswith("--host="):
+            host = a.split("=", 1)[1]
+        elif a in ("-h", "--help"):
+            rest.append(a)
+        else:
+            rest.append(a)
+        i += 1
+    if rest:
+        die("--startserver 与其他子命令/参数互斥：%s\n"
+            "  用法：sshbind --startserver [--port 8790] [--host 127.0.0.1] "
+            "[--daemon] [--open]"
+            % " ".join(rest), code=2)
+    if not saw:
+        die("内部错误：未检测到 --startserver", code=2)
+    if not (1 <= port <= 65535):
+        die("端口超出范围：%d" % port, code=2)
+    return port, host, daemon, open_browser
+
+
+def start_console_mode(argv):
+    port, host, daemon, open_browser = _parse_startserver_args(argv)
+    lib = bindconsole_lib()
+    kernel = os.path.join(lib, "bindkit_console.py")
+    if not os.path.isfile(kernel):
+        sys.stderr.write("ERROR 找不到 bindconsole 内核：%s\n"
+                         "       code: UNSUPPORTED\n"
+                         "      先安装：%s\n" % (kernel, BINDCONSOLE_INSTALL_CMD))
+        return 1
+    if lib not in sys.path:
+        sys.path.insert(0, lib)
+    try:
+        from bindkit_console import run_console
+    except Exception as e:                     # noqa: BLE001
+        sys.stderr.write("ERROR 加载 bindconsole 内核失败：%s\n"
+                         "      重新安装：%s\n" % (e, BINDCONSOLE_INSTALL_CMD))
+        return 1
+    os.environ.setdefault("BINDCONSOLE_HOME", bindconsole_home())
+    try:
+        rc = run_console("ssh", port=port, handlers=build_console_handlers(),
+                         daemon=daemon, open_browser=open_browser, host=host)
+    except TypeError:
+        # 老内核没有 host 参数：回环模式退化成旧签名，非回环明确报错
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            sys.stderr.write("ERROR 当前 bindconsole 内核不支持 --host（需要重新安装）：%s\n"
+                             "      重新安装：%s\n" % (host, BINDCONSOLE_INSTALL_CMD))
+            return 1
+        rc = run_console("ssh", port, build_console_handlers(),
+                         daemon=daemon, open_browser=open_browser)
+    return 0 if rc is None else int(rc)
+
+
+
+
+def cmd_exec(args):
+    """在远端执行一条命令。专为自动化/agent 设计：
+       强制 BatchMode（失败即报错，绝不卡在密码提示）、透传远端退出码、可选 JSON 输出。"""
+    state = load_state()
+    s = state["servers"].get(args.name)
+    if not s:
+        die("没有名为 %s 的绑定。先执行 sshbind list 看看有哪些" % args.name)
+    if not os.path.exists(s["key"]):
+        die("私钥缺失，无法连接：%s" % s["key"])
+
+    command = " ".join(args.command).strip()
+    if not command:
+        die("请给出要执行的命令，例如：sshbind exec %s 'df -h'" % args.name)
+
+    # REMAINDER 会把别名之后的选项也吞进来，这里挡住这种误用（否则会静默执行错命令）
+    misplaced = [t for t in args.command if t in ("--json", "--timeout")]
+    if misplaced:
+        die("选项必须写在别名之前，例如：\n"
+            "    sshbind exec --json %s '你的命令'\n"
+            "  检测到被当成命令一部分的选项：%s" % (args.name, " ".join(misplaced)))
+
+    # bindconsole 策略闸门（CONTRACT §8.2）：取到 command 后、建连前判定
+    gate = _policy_gate_ssh(args.name, command)
+    if gate and gate.get("decision") in ("deny", "ask"):
+        return _emit_gate_ssh(args, gate, command)
+
+    # 注意：远端 .bashrc 的噪音（nvm / locale 之类）会打在 stderr 上，且无法从客户端屏蔽
+    # （bash 检测到 stdin 来自网络连接时就会读 ~/.bashrc，早于我们的命令执行）。
+    # 好消息是 stdout 是干净的，所以脚本读 stdout、或直接用 --json 就能准确取值。
+    remote_cmd = command
+
+    cmd = ssh_with_key(s["host"], s["user"], s["port"], s["key"],
+                       s.get("certificate")) + [remote_cmd]
+    t0 = time.time()
+    rc, out, err = run_ssh(cmd, timeout=args.timeout)
+    ms = int((time.time() - t0) * 1000)
+
+    if args.json:
+        print(json.dumps({
+            "alias": args.name, "host": s["host"], "user": s["user"],
+            "command": command, "exit_code": rc,
+            "stdout": out, "stderr": err, "duration_ms": ms,
+        }, ensure_ascii=False, indent=2))
+        return rc if 0 <= rc <= 255 else 1
+
+    if out:
+        sys.stdout.write(out)
+    if err:
+        sys.stderr.write(err)
+    return rc if 0 <= rc <= 255 else 1
+
+
+def cmd_doctor(args):
+    print()
+    checks = [("ssh 命令", shutil.which("ssh") is not None),
+              ("ssh-keygen 命令", shutil.which("ssh-keygen") is not None)]
+    ver = subprocess.run(["ssh", "-V"], stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT).stdout.decode()
+    checks.append(("OpenSSH 版本: %s" % ver.strip(), True))
+    askpass_ok = True
+    try:
+        askpass_ok = int(re.search(r"OpenSSH_(\d+)", ver).group(1)) >= 9
+    except (AttributeError, ValueError, TypeError):
+        pass
+    checks.append(("SSH_ASKPASS_REQUIRE 支持（非交互输密码/口令）", askpass_ok))
+    agent_keys = subprocess.run(["ssh-add", "-l"], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+    if agent_keys.returncode == 0:
+        n = len([l for l in agent_keys.stdout.decode().splitlines() if l.strip()])
+        checks.append(("ssh-agent 可用（已加载 %d 把密钥）" % n, True))
+    else:
+        checks.append(("ssh-agent 可用", False))
+    for label, good in checks:
+        print("  %s %s" % (("✅" if good else "⚠️ "), label))
+    print()
+    state = load_state()
+    adopted = sum(1 for s in state["servers"].values() if s.get("source") == "adopted")
+    print("  已绑定服务器：%d 台（其中纳管 %d 台）" % (len(state["servers"]), adopted))
+    print("  密钥目录：%s" % KEYS_DIR)
+    print()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
+
+def add_auth_args(p):
+    """给 add / adopt 挂上认证相关的参数。"""
+    g = p.add_argument_group("首次认证方式（三选一，默认交互式提示密码）")
+    g.add_argument("--password-stdin", action="store_true",
+                   help="从标准输入读登录密码")
+    g.add_argument("--identity", action="append", metavar="私钥文件",
+                   help="用已有私钥认证（可重复指定多把）")
+    g.add_argument("--identity-passphrase-stdin", action="store_true",
+                   help="从标准输入读已有私钥的口令")
+    g.add_argument("--agent", action="store_true",
+                   help="用 ssh-agent 中已加载的密钥认证")
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="sshbind",
+        description="绑定 Linux 服务器：认证一次，之后永久免密；密钥可集中管理。",
+        epilog="认证方式示例：\n"
+               "  sshbind add prod --host 10.0.0.5                      # 提示输入密码\n"
+               "  sshbind add prod --host 10.0.0.5 --identity ~/.ssh/id_rsa\n"
+               "  sshbind add prod --host 10.0.0.5 --agent\n"
+               "  sshbind adopt old --host 10.0.0.6 --identity ~/.ssh/id_ed25519\n"
+               "\n本机 Web 控制台：\n"
+               "  sshbind --startserver [--port 8790] [--host 127.0.0.1] [--daemon] [--open]\n"
+               "      # Web 控制台；--host HOST 监听地址（默认 127.0.0.1，局域网访问用 0.0.0.0）\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = p.add_subparsers(dest="cmd")
+
+    a = sub.add_parser("add", help="绑定服务器（生成专属密钥并推送公钥）")
+    a.add_argument("name", help="别名，之后 ssh <别名> 即可")
+    a.add_argument("--host", required=True, help="服务器地址（IP 或域名）")
+    a.add_argument("--user", default="root", help="登录用户名（默认 root）")
+    a.add_argument("--port", type=int, default=22, help="SSH 端口（默认 22）")
+    a.add_argument("--key-type", default="ed25519",
+                   choices=["ed25519", "rsa", "ecdsa"], help="新密钥算法（默认 ed25519）")
+    a.add_argument("--key-passphrase", default=None,
+                   help="给新私钥加口令（默认无口令便于自动化；加了需配合 ssh-agent）")
+    a.add_argument("--restrict", action="store_true",
+                   help="在远端给公钥加 restrict 前缀（禁用端口转发/pty 等）")
+    a.add_argument("--force", action="store_true", help="覆盖同名绑定")
+    add_auth_args(a)
+    a.set_defaults(func=cmd_add)
+
+    ad = sub.add_parser("adopt", help="纳管已有密钥（不生成、不推送，只登记并验证）")
+    ad.add_argument("name", help="别名")
+    ad.add_argument("--host", required=True, help="服务器地址")
+    ad.add_argument("--user", default="root", help="登录用户名（默认 root）")
+    ad.add_argument("--port", type=int, default=22, help="SSH 端口（默认 22）")
+    ad.add_argument("--identity", action="append", metavar="私钥文件", required=True,
+                    help="要纳管的私钥文件")
+    ad.add_argument("--certificate", metavar="证书文件",
+                    help="SSH 证书（默认自动查找 <私钥>-cert.pub）")
+    ad.add_argument("--password-stdin", action="store_true",
+                    help="从标准输入首行读密码（控制台统一入口用；adopt 用密钥验证，不消费密码）")
+    ad.add_argument("--force", action="store_true", help="验证失败也强行登记")
+    ad.set_defaults(func=cmd_adopt)
+
+    l = sub.add_parser("list", help="列出所有绑定")
+    l.add_argument("--json", action="store_true", help="输出 JSON（推荐给脚本/agent 用）")
+    l.set_defaults(func=cmd_list)
+
+    ex = sub.add_parser("exec", help="在远端执行命令（自动化/agent 推荐入口）")
+    ex.add_argument("--json", action="store_true",
+                    help="以 JSON 输出（含 exit_code / stdout / stderr / duration_ms）")
+    ex.add_argument("--timeout", type=int, default=120, help="超时秒数（默认 120）")
+    ex.add_argument("name", help="服务器别名")
+    ex.add_argument("command", nargs=argparse.REMAINDER,
+                    help="要执行的命令（选项须写在别名之前）")
+    ex.set_defaults(func=cmd_exec)
+
+    s = sub.add_parser("show", help="查看某台服务器的详情")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_show)
+
+    pk = sub.add_parser("pubkey", help="打印公钥（用于手动粘贴到服务器）")
+    pk.add_argument("name")
+    pk.set_defaults(func=cmd_pubkey)
+
+    t = sub.add_parser("test", help="测试免密登录是否正常")
+    t.add_argument("name", nargs="?", help="服务器别名")
+    t.add_argument("--all", action="store_true", help="测试全部")
+    t.set_defaults(func=cmd_test)
+
+    r = sub.add_parser("remove", help="解绑：远端删公钥 + 清 config（本地密钥可选删）")
+    r.add_argument("name")
+    r.add_argument("--keep-key", action="store_true", help="保留本地密钥文件")
+    r.add_argument("--delete-key", action="store_true",
+                   help="纳管的已有密钥也一并删除密钥文件（默认保留）")
+    r.add_argument("--no-revoke", action="store_true", help="跳过远端公钥清理")
+    r.add_argument("--force", action="store_true", help="远端清理失败时也继续")
+    r.add_argument("--yes", action="store_true", help="跳过确认")
+    r.set_defaults(func=cmd_remove)
+
+    im = sub.add_parser("import", help="从其他 SSH 客户端导入连接（目前支持 FinalShell）")
+    im.add_argument("source", help="来源，目前支持：finalshell")
+    im.add_argument("--dir", help="手动指定该客户端的配置目录")
+    im.add_argument("--with-passwords", action="store_true",
+                    help="解密客户端保存的密码并自动完成免密绑定（默认只预览）")
+    im.add_argument("--only", help="只导入这些名称/地址，逗号分隔")
+    im.add_argument("--rename", action="append", metavar="原名=新名",
+                    help="指定别名映射（可重复）。中文名无法直接用作 SSH 别名，会自动转换")
+    im.add_argument("--key-type", default="ed25519",
+                    choices=["ed25519", "rsa", "ecdsa"], help="新密钥算法（默认 ed25519）")
+    im.add_argument("--restrict", action="store_true",
+                    help="在远端给公钥加 restrict 前缀")
+    im.add_argument("--yes", action="store_true", help="跳过确认")
+    im.set_defaults(func=cmd_import)
+
+    d = sub.add_parser("doctor", help="自检环境")
+    d.set_defaults(func=cmd_doctor)
+
+    return p
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # bindconsole 契约 §2：先扫描 --startserver，不影响任何既有子命令
+    if "--startserver" in argv:
+        try:
+            return start_console_mode(argv)
+        except KeyboardInterrupt:
+            warn("已中断")
+            return 130
+        except SystemExit:
+            raise
+        except Exception as e:                 # noqa: BLE001
+            sys.stderr.write("ERROR 控制台启动失败：%s\n" % e)
+            return 1
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "cmd", None):
+        parser.print_help()
+        return 0
+    ensure_dirs()
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        print()
+        warn("已中断")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

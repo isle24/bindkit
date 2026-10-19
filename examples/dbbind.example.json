@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "defaults": {"read_only": true, "limit": 1000},
+  "databases": {
+    "demo-mysql": {
+      "engine": "mysql", "host": "db.example.com", "port": 3306,
+      "user": "app_reader", "password": "$DEMO_MYSQL_PASSWORD", "database": "appdb"
+    },
+    "demo-pg": {
+      "engine": "postgres", "host": "db.example.com", "port": 5432,
+      "user": "app_reader", "password": "$DEMO_PG_PASSWORD", "database": "appdb"
+    },
+    "local-sqlite": {"engine": "sqlite", "file": "~/data/app.sqlite"},
+    "container-mysql": {
+      "engine": "mysql", "host": "127.0.0.1", "port": 3306,
+      "user": "app_reader", "password": "$DEMO_MYSQL_PASSWORD", "database": "appdb",
+      "docker_exec": "demo-server:mysql"
+    }
+  }
+}
