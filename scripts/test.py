@@ -18,6 +18,19 @@ COMMANDS = [
 ]
 
 
+def _group_is_running(pgid):
+    # macOS may return EPERM, rather than ESRCH, for an exited group that only
+    # contains zombies. Inspect process metadata only, never command arguments.
+    status = subprocess.run(['ps', '-axo', 'pgid=,stat='], capture_output=True, text=True)
+    if status.returncode:
+        return True
+    for line in status.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0] == str(pgid) and not fields[1].startswith('Z'):
+            return True
+    return False
+
+
 def run_suite(args, env, timeout=180):
     proc = subprocess.Popen([sys.executable, *args], cwd=ROOT, env=env, start_new_session=True)
     try:
@@ -37,7 +50,10 @@ def run_suite(args, env, timeout=180):
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        proc.wait()
+        except PermissionError:
+            if _group_is_running(proc.pid):
+                raise RuntimeError('Unable to terminate the owned test process group')
+        proc.wait(timeout=5)
         return 124
 
 

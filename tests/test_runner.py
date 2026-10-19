@@ -6,11 +6,27 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class RunnerTests(unittest.TestCase):
+    def test_dead_macos_group_permission_error_is_not_cleanup_failure(self):
+        spec = importlib.util.spec_from_file_location('bindkit_runner', ROOT / 'scripts/test.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        proc = MagicMock(pid=123456)
+        proc.wait.side_effect = [subprocess.TimeoutExpired('synthetic', 1), -15, -15]
+        with patch.object(mod.subprocess, 'Popen', return_value=proc), \
+                patch.object(mod.os, 'killpg', side_effect=[None, PermissionError(1, 'synthetic EPERM')]), \
+                patch.object(mod, '_group_is_running', return_value=False, create=True):
+            try:
+                rc = mod.run_suite(['synthetic'], {}, timeout=1)
+            except PermissionError:
+                self.fail('a terminated group with no live members must not fail on macOS EPERM')
+        self.assertEqual(rc, 124)
+
     def test_timed_out_suite_does_not_leave_child_process(self):
         spec = importlib.util.spec_from_file_location('bindkit_runner', ROOT / 'scripts/test.py')
         mod = importlib.util.module_from_spec(spec)
