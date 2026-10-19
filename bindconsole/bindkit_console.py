@@ -95,6 +95,7 @@ import urllib.parse
 import webbrowser
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 
 try:                                    # 仅 POSIX 用于枚举网卡 IPv4（LAN 模式）
     import fcntl
@@ -113,7 +114,7 @@ DEFAULT_PORTS = {"ssh": 8790, "db": 8791}
 LOOPBACK_HOSTS = ("127.0.0.1", "::1")
 WILDCARD_HOSTS = ("0.0.0.0",)
 LAN_ALLOWED_HINT = ("允许：127.0.0.1（默认）、0.0.0.0（所有网卡）、::1、"
-                    "本机局域网 IPv4（如 192.0.2.11）")
+                    "本机局域网 IPv4（如 192.168.1.10）")
 # 局域网模式只接受 RFC1918 / 链路本地 / CGNAT 地址；公网地址即使本机持有也拒绝
 LAN_NETWORKS = tuple(ipaddress.IPv4Network(cidr) for cidr in (
     "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
@@ -246,11 +247,6 @@ def _local_ipv4_addresses():
                 pass
             finally:
                 sock.close()
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            found.append(info[4][0])
-    except OSError:
-        pass
     try:                                # 默认路由所在网卡地址（无实际流量）
         probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -1688,6 +1684,13 @@ class ConsoleHTTPServer(ThreadingHTTPServer):
     def __init__(self, server_address, app):
         self.app = app
         super().__init__(server_address, ConsoleRequestHandler)
+
+    def server_bind(self):
+        # The console accepts IP literals only. HTTPServer's default getfqdn()
+        # reverse lookup is unnecessary and can block on managed/offline hosts.
+        TCPServer.server_bind(self)
+        self.server_name = self.server_address[0]
+        self.server_port = self.server_address[1]
 
     @property
     def urls(self):

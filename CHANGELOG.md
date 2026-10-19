@@ -13,6 +13,7 @@ First public release of sshbind, dbbind and the local web consoles under the MIT
 - Added state-preserving user-level installation, code backups, rollback, checksum validation and safe code-only uninstall.
 - Removed environment-specific examples and release data; added portable isolated tests and CI.
 - The SSH web console invokes its own CLI executable, including custom installation directories.
+- Numeric-IP console binding and local interface discovery do not depend on DNS resolution.
 
 Platforms: macOS/Linux with Python 3.9+ and OpenSSH. Database clients are installed separately.
 No native Windows support, public hosting, multi-user isolation or independent release signatures.

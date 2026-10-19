@@ -193,7 +193,7 @@ def start_console_logged(tool_cmd, home, port, extra=()):
     env.pop("BINDCONSOLE_HOME", None)
     log_path = os.path.join(home, "console-%d.log" % port)
     log = open(log_path, "w", encoding="utf-8")
-    proc = subprocess.Popen([tool_cmd, "--startserver", "--port", str(port)] + list(extra),
+    proc = subprocess.Popen([sys.executable, tool_cmd, "--startserver", "--port", str(port)] + list(extra),
                             stdout=log, stderr=subprocess.STDOUT, env=env)
     PROCS.append(proc)
     return proc, log_path
@@ -203,7 +203,7 @@ def start_console(tool_cmd, tool, home, port):
     env = dict(os.environ)
     env["HOME"] = home
     env.pop("BINDCONSOLE_HOME", None)
-    proc = subprocess.Popen([tool_cmd, "--startserver", "--port", str(port)],
+    proc = subprocess.Popen([sys.executable, tool_cmd, "--startserver", "--port", str(port)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     PROCS.append(proc)
     return proc
@@ -245,7 +245,13 @@ def test_db_console(home, kernel_ok):
     base = "http://127.0.0.1:%d" % port
     if not wait_up(Client(base)):
         proc = PROCS[-1]
-        err = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
+        proc.terminate()
+        try:
+            _, raw_error = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _, raw_error = proc.communicate(timeout=5)
+        err = (raw_error or b"").decode("utf-8", "replace")
         check("dbbind 控制台启动", False, err[-400:])
         return
     check("dbbind 控制台启动并监听", True)
@@ -329,7 +335,13 @@ def test_ssh_console(home, kernel_ok):
     base = "http://127.0.0.1:%d" % port
     if not wait_up(Client(base)):
         proc = PROCS[-1]
-        err = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
+        proc.terminate()
+        try:
+            _, raw_error = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _, raw_error = proc.communicate(timeout=5)
+        err = (raw_error or b"").decode("utf-8", "replace")
         check("sshbind 控制台启动", False, err[-400:])
         return
     check("sshbind 控制台启动并监听", True)
