@@ -38,3 +38,5 @@ scripts/check_release.py
 scripts/build_release.py
 tests/test_install.py
 tests/test_bootstrap.py
+tests/test_ci_network.py
+tests/test_runner.py

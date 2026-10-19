@@ -104,6 +104,7 @@ class Client(object):
         self.base = base
         self.jar = http.cookiejar.CookieJar()
         self.opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
             urllib.request.HTTPCookieProcessor(self.jar))
         self.token = None
 
