@@ -28,3 +28,22 @@ FinalShell 先预览：`sshbind import finalshell`；明确执行密码型连接
 
 Web 中的 sudo=allow/ask/deny 通过策略守卫作用于 exec；默认无策略时保持原兼容行为。
 它不能撤销 root 账号本身的权限，也不能代替 sudoers。
+
+## 无需删除别名的凭据维护
+
+Web 编辑允许更新 host/user/port、登录密码或私钥。登录密码仅用于安装替换公钥，不修改远端密码。
+验证成功才保存连接；旧本机和远端密钥保留，不自动吊销。sudo 密码为独立的仅写入字段，保存到运行 BindKit 本机的系统钥匙串。
+安装可选依赖：`bash install.sh --with-integrations`。字段留空不修改，显式清除会删除对应钥匙串项。
+
+```bash
+sshbind exec --json --as-user app demo-server 'id'
+sshbind exec --json --as-user root demo-server 'id'
+```
+
+普通身份须位于服务器允许列表并解析出普通 UID，才可免身份审批；root/敏感/未知身份和嵌套命令仍审批。
+受管理 sudo 会在实际密码提示时代输；NOPASSWD/认证缓存不发送密码。TTY/MFA 和复杂交互形式不支持自动认证。
+`--stdin` 显式启用命令输入；选项仍在别名前。执行状态未知时禁止自动重试。
+
+服务器页「导入连接」先预览 Xshell `.xsh`/普通 ZIP、FinalShell SSH JSON 或 OpenSSH config，选择条目后补充凭据。
+不恢复受保护 `.xts` 容器或加密密码，不读取引用密钥文件、不执行代理/本地命令、不覆盖现有别名。
+更多步骤见 [管理说明](administration.md)。

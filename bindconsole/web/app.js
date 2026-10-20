@@ -28,7 +28,7 @@
     }
   };
 
-  var ROUTES = ['setup', 'login', 'servers', 'databases', 'approvals', 'audit'];
+  var ROUTES = ['setup', 'login', 'servers', 'databases', 'approvals', 'audit', 'ai'];
 
   var state = {
     tool: null,
@@ -315,12 +315,14 @@
       ? [
           { route: 'servers', label: '服务器' },
           { route: 'approvals', label: '审批中心' },
-          { route: 'audit', label: '审计' }
+          { route: 'audit', label: '审计' },
+          { route: 'ai', label: 'AI 审批' }
         ]
       : [
           { route: 'databases', label: '数据库' },
           { route: 'approvals', label: '审批中心' },
-          { route: 'audit', label: '审计' }
+          { route: 'audit', label: '审计' },
+          { route: 'ai', label: 'AI 审批' }
         ];
 
     var nav = UI.el('nav', { 'class': 'nav', 'aria-label': '主导航' });

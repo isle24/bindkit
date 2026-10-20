@@ -64,6 +64,20 @@ class InstallTests(unittest.TestCase):
         self.assertEqual([p.read_text() for p in map(self.home.__truediv__, sentinels)],
                          ['disposable-user-state-marker'] * len(sentinels))
 
+    def test_upgrade_refreshes_only_unmodified_installer_managed_agent_guides(self):
+        self.install()
+        managed = self.home / '.ssh/sshbind/AGENT.md'
+        edited = self.home / '.dbbind/AGENT.md'
+        edited.write_text('user-written guide must survive')
+        original = Path.read_bytes
+        new_guide = original(ROOT / 'AGENT.md') + b'\nSynthetic upgrade instruction.\n'
+        def read(path):
+            return new_guide if path == ROOT / 'AGENT.md' else original(path)
+        with patch.object(Path, 'read_bytes', read):
+            self.install()
+        self.assertEqual(managed.read_bytes(), new_guide)
+        self.assertEqual(edited.read_text(), 'user-written guide must survive')
+
     def test_failed_install_rolls_back_replaced_files(self):
         tool = self.home / '.local/bin/sshbind'
         tool.parent.mkdir(parents=True)

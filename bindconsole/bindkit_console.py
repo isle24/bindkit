@@ -106,7 +106,7 @@ except ImportError:                     # pragma: no cover - Windows
 # 常量
 # ---------------------------------------------------------------------------
 
-KERNEL_VERSION = "1.0.0"
+KERNEL_VERSION = "1.1.0"
 VERSION = KERNEL_VERSION                      # 兼容别名
 
 ALLOWED_TOOLS = ("ssh", "db")
@@ -1284,7 +1284,9 @@ class ConsoleApp:
         self.handlers = dict(handlers) if isinstance(handlers, dict) else {}
 
         self.home = os.path.abspath(os.path.expanduser(home)) if home else os.path.expanduser("~")
-        self.runtime_dir = os.path.join(self.home, ".bindconsole")
+        self.runtime_dir = (os.path.abspath(os.path.expanduser(os.environ["BINDCONSOLE_HOME"]))
+                            if home is None and os.environ.get("BINDCONSOLE_HOME")
+                            else os.path.join(self.home, ".bindconsole"))
         if tool == "ssh":
             self.tool_home = os.path.join(self.home, ".ssh", "sshbind")
         else:
@@ -1334,6 +1336,12 @@ class ConsoleApp:
                     "注入的 policy 模块接口不完整，缺少：%s" % ", ".join(missing))
             self.policy_module = policy
         self.approvals = ApprovalStore(self)
+        self._admin_api = None
+        try:
+            from bindkit_admin import AdminAPI
+            self._admin_api = AdminAPI(self)
+        except ImportError:
+            pass  # Older core-only fixtures/installations retain their original routes.
         self.started_at = time.time()
 
     # ---- 审计 ----
@@ -1506,13 +1514,34 @@ class ConsoleApp:
         return {"approval": result}
 
     def list_audit(self, query):
-        raw_limit = _flat_query(query).get("limit")
+        params = _flat_query(query)
+        # Preserve original limit callers while the paged API returns a complete envelope.
+        paging_keys = ("page", "page_size", "snapshot", "actor", "decision", "alias")
+        legacy_backend = self.policy_module is not None and not getattr(self.policy_module, "AUDIT_LOG", None)
+        if ("limit" not in params and not legacy_backend) or any(key in params for key in paging_keys):
+            try:
+                from bindkit_catalog import read_audit_page
+                path = (getattr(self.policy_module, "AUDIT_LOG", None)
+                        or os.path.join(self.runtime_dir, "audit.log"))
+                return read_audit_page(path, tool=params.get("tool") or self.tool,
+                    page=int(params.get("page") or 1), page_size=int(params.get("page_size") or 50),
+                    actor=params.get("actor") or None, decision=params.get("decision") or None,
+                    alias=params.get("alias") or None, snapshot=params.get("snapshot") or None)
+            except ValueError as exc:
+                if "snapshot" in str(exc):
+                    raise ConsoleError("AUDIT_SNAPSHOT_EXPIRED", "审计快照已更新，请返回第一页", status=409) from None
+                raise ConsoleError("INVALID_PARAM", "审计分页参数无效（page ≥ 1，page_size 为 1–200）") from None
+            except ImportError:
+                raise ConsoleError("INTEGRATION_MISSING", "请重新运行安装程序以更新审计模块", status=503) from None
+            except OSError:
+                raise ConsoleError("AUDIT_READ_ERROR", "审计读取失败，请检查运行目录权限", status=500) from None
+        raw_limit = params.get("limit")
         try:
             limit = int(raw_limit) if raw_limit not in (None, "") else AUDIT_DEFAULT_LIMIT
         except (TypeError, ValueError):
             raise ConsoleError("INVALID_PARAM", "limit 必须是整数")
         limit = max(1, min(limit, AUDIT_MAX_LIMIT))
-        tool_filter = (_flat_query(query).get("tool") or self.tool).strip()
+        tool_filter = (params.get("tool") or self.tool).strip()
         if tool_filter not in ("ssh", "db", "all"):
             raise ConsoleError("INVALID_PARAM", "tool 只能是 ssh、db 或 all")
         return {"entries": self.read_audit(limit, tool_filter)}
@@ -1530,7 +1559,7 @@ class ConsoleApp:
         return name
 
     def _audit_handler_call(self, verb, name, decision, detail=None):
-        if verb in ("list", "get", "policy_get"):
+        if verb in ("list", "get", "policy_get", "users"):
             return
         if verb in ("policy_put",):
             action = "policy.update"
@@ -1558,6 +1587,7 @@ class ConsoleApp:
             "update": [name, body],
             "delete": [name, body],
             "test": [name],
+            "users": [name],
             "policy_get": [],
             "policy_put": [body],
         }
@@ -1983,6 +2013,17 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             self._send_ok(200, data, head=head, cookies=cookies)
             return
 
+        if rest and rest[0] in ("ai", "imports"):
+            try:
+                from bindkit_admin import dispatch, AdminError
+            except ImportError:
+                raise ConsoleError("INTEGRATION_MISSING", "请重新运行安装程序以更新管理模块", status=503) from None
+            try:
+                self._send_ok(200, dispatch(app, method, rest, self._body), head=head)
+            except AdminError as exc:
+                raise ConsoleError(exc.code, exc.message, status=exc.status) from None
+            return
+
         if rest == ["approvals"]:
             self._require_method(method, ("GET",))
             status_filter = (_flat_query(query).get("status") or "pending").strip()
@@ -2055,6 +2096,11 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
                 self._send_ok(200, data, head=head)
                 return
             self._method_not_allowed(("POST",))
+        if app.tool == "ssh" and len(tail) == 2 and tail[1] == "users":
+            self._require_method(method, ("GET",))
+            name = _validate_name(tail[0], field="name")
+            self._send_ok(200, app.call_handler("users", name=name), head=head)
+            return
         raise ConsoleError("NOT_FOUND", "接口不存在", status=404)
 
     # ---- 认证辅助 ----

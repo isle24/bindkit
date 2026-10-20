@@ -89,7 +89,9 @@ def make_home(tool):
     # 内核安装副本
     lib = os.path.join(home, ".bindconsole", "lib")
     os.makedirs(lib, exist_ok=True)
-    shutil.copy(os.path.join(PROJECT, "bindkit_policy.py"), lib)
+    for filename in os.listdir(PROJECT):
+        if filename.startswith('bindkit_') and filename.endswith('.py'):
+            shutil.copy(os.path.join(PROJECT, filename), lib)
     if not os.path.isfile(os.path.join(PROJECT, "bindkit_console.py")):
         return home, False
     shutil.copy(os.path.join(PROJECT, "bindkit_console.py"), lib)

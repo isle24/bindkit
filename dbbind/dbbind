@@ -47,7 +47,7 @@ import time
 from datetime import datetime
 from urllib.parse import quote
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 PROG = "dbbind"
 
 # ---------------------------------------------------------------------------
@@ -2915,18 +2915,50 @@ def load_policy_module(required=False):
         return None
 
 
-def _policy_gate_db(rec, sql, requested_write, requested_unsafe):
-    """调策略闸门。返回 None（无策略模块/无策略文件 → 放行且零副作用）或闸门 dict。"""
+def _policy_gate_db(rec, sql, requested_write, requested_unsafe, operation="exec", refresh_record=None):
+    """Deterministic policy first; optional AI can only fill its pending approval."""
+    # Apply command flags before a gate can consume a previously approved request.
+    check_client_metacommands(sql, rec["engine"])
+    guard_sql(rec, sql, write_ok=requested_write, unsafe=requested_unsafe)
     mod = load_policy_module()
     if mod is None:
         return None
     try:
-        return mod.gate_db(rec["name"], sql, rec.get("engine") or "mysql",
-                           rec.get("database") if rec.get("engine") != "sqlite"
-                           else None,
-                           requested_write=requested_write,
-                           requested_unsafe=requested_unsafe, requester="ai")
-    except Exception:                          # noqa: BLE001 —— 闸门绝不抛给主流程
+        try:
+            import bindkit_orchestration as orchestration
+        except ImportError:
+            orchestration = None
+        context = {"connection": orchestration.connection_context(rec, "db"), "operation": operation} if orchestration else None
+        checked = False
+        def recheck():
+            nonlocal checked
+            if checked and refresh_record is not None:
+                latest = refresh_record()
+                if orchestration.connection_context(latest, "db") != context["connection"]:
+                    return {"decision": "deny", "code": "CONNECTION_CHANGED", "message": "数据库连接已变化，请重新提交并审核。"}
+                # A changed local read-only flag can tighten access independently of policy.json.
+                guard_sql(latest, sql, write_ok=requested_write, unsafe=requested_unsafe)
+            checked = True
+            return mod.gate_db(rec["name"], sql, rec.get("engine") or "mysql",
+                rec.get("database") if rec.get("engine") != "sqlite" else None,
+                requested_write=requested_write, requested_unsafe=requested_unsafe,
+                requester="ai", **({"context": context} if context is not None else {}))
+        gate = recheck()
+        if gate.get("decision") == "ask" and orchestration:
+            # Existing DML/DDL flags and read-only guard remain hard requirements.
+            try:
+                check_client_metacommands(sql, rec["engine"])
+                guard_sql(rec, sql, write_ok=requested_write, unsafe=requested_unsafe)
+            except DbbindError:
+                return gate
+            review_context = {"policy_revision": mod.policy_revision("db"), "operation": operation,
+                "resource": {"alias": rec["name"], **{field: rec.get(field) for field in ("engine", "host", "port", "user", "database")}},
+                "target_user": rec.get("user"), "target_uid": None,
+                "effective_level": mod.sql_required_level(sql, rec.get("engine") or "mysql"),
+                "hard_allowed": True, "protected": orchestration.protected_operation(sql) or bool(context["connection"].get("transport_requires_human")), "sql": sql}
+            gate = orchestration.review_gate("db", gate, review_context, mod, recheck)
+        return gate
+    except Exception:
         return {"decision": "deny", "code": "AUTHZ_DENIED",
                 "message": "策略校验内部错误，已按 fail-closed 拒绝",
                 "hint": "查看 ~/.bindconsole/audit.log"}
@@ -3413,7 +3445,10 @@ def cmd_exec(args):
     write_ok = bool(args.write or args.unsafe)
     # bindconsole 策略闸门（先策略、后原只读守卫；策略上限优先于 --write/--unsafe）
     policy_rec = dict(rec, database=args.database or rec.get("database"))
-    gate = _policy_gate_db(policy_rec, sql, write_ok, bool(args.unsafe))
+    def refresh_record():
+        latest = require_usable(get_entry(current_config(args), args.name))
+        return dict(latest, database=args.database or latest.get("database"))
+    gate = _policy_gate_db(policy_rec, sql, write_ok, bool(args.unsafe), refresh_record=refresh_record)
     gate_warnings = list(gate.get("warnings") or []) if gate else []
     if gate and gate.get("decision") in ("deny", "ask"):
         raise _raise_gate(gate)
@@ -3473,7 +3508,8 @@ def cmd_export(args):
         die("USAGE", "--format 只支持 csv|json|jsonl|sql（table 不适合导出）")
     check_client_metacommands(args.sql, rec["engine"])
     write_ok = bool(getattr(args, "write", False) or getattr(args, "unsafe", False))
-    gate = _policy_gate_db(rec, args.sql, write_ok, bool(getattr(args, "unsafe", False)))
+    gate = _policy_gate_db(rec, args.sql, write_ok, bool(getattr(args, "unsafe", False)), operation="export",
+        refresh_record=lambda: require_usable(get_entry(current_config(args), args.name)))
     if gate and gate.get("decision") in ("deny", "ask"):
         raise _raise_gate(gate)
     warnings = list((gate or {}).get("warnings") or []) + guard_sql(

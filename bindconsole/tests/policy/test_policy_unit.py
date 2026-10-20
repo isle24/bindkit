@@ -583,20 +583,20 @@ def test_console_helpers():
           eff_ssh["approval_ttl_s"] == 600, eff_ssh)
     # 签名冻结（防止以后误改）
     import inspect
-    check("approve 签名冻结",
+    check("approve 签名兼容扩展",
           str(inspect.signature(P.approve)) ==
-          "(tool, approval_id, consumes=1, ttl_s=600, note=None, decided_by='web')",
+          "(tool, approval_id, consumes=1, ttl_s=600, note=None, decided_by='web', expected_fingerprint=None, expected_policy_revision=None)",
           inspect.signature(P.approve))
-    check("reject 签名冻结",
+    check("reject 签名兼容扩展",
           str(inspect.signature(P.reject)) ==
-          "(tool, approval_id, note=None, decided_by='web')", inspect.signature(P.reject))
+          "(tool, approval_id, note=None, decided_by='web', expected_fingerprint=None, expected_policy_revision=None)", inspect.signature(P.reject))
     check("list_approvals 签名", str(inspect.signature(P.list_approvals)).startswith("(tool=None"))
     check("read_audit 签名", str(inspect.signature(P.read_audit)).startswith("(tool=None"))
     check("gate_ssh 签名", str(inspect.signature(P.gate_ssh)) ==
-          "(alias, command, requester='ai')", inspect.signature(P.gate_ssh))
+          "(alias, command, requester='ai', context=None)", inspect.signature(P.gate_ssh))
     check("gate_db 签名", str(inspect.signature(P.gate_db)) ==
           "(alias, sql, engine, default_db, requested_write=False, "
-          "requested_unsafe=False, requester='ai')", inspect.signature(P.gate_db))
+          "requested_unsafe=False, requester='ai', context=None)", inspect.signature(P.gate_db))
 
 
 def main():

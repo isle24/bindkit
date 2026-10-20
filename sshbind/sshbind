@@ -42,6 +42,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
+import uuid
+import importlib
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
@@ -514,7 +517,7 @@ def run_ssh(cmd, secret_handle=None, stdin_data=None, timeout=120):
     try:
         proc = subprocess.run(
             cmd,
-            input=(stdin_data.encode("utf-8") if stdin_data is not None else None),
+            input=(stdin_data.encode("utf-8") if isinstance(stdin_data, str) else stdin_data),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=(subprocess.DEVNULL if stdin_data is None else None),
@@ -850,7 +853,87 @@ def validate_name(name):
 # 子命令
 # ---------------------------------------------------------------------------
 
+def _cmd_add_verified(args):
+    """Console-only transaction: publish an alias only after new-key verification.
+
+    Unique candidate names let a failed import retry without overwriting a user's
+    existing key. No remote key is revoked, including after an uncertain install.
+    """
+    name = args.name
+    validate_name(name)
+    if args.force:
+        die("严格验证模式不允许覆盖已有连接")
+    if name in load_state()["servers"]:
+        die("名称已存在：%s" % name)
+    candidate_name = name + "-verified-" + uuid.uuid4().hex
+    owned_paths = key_paths(candidate_name)
+    committed = False
+    config_written = False
+    preserve_candidate = False
+    try:
+        auth = resolve_auth(args)
+        priv, pub = gen_keypair(candidate_name, key_type=args.key_type,
+                                passphrase=args.key_passphrase or "")
+        pubkey = read_pubkey(candidate_name)
+        fingerprint = fingerprint_of(pubkey)
+        certificate = find_certificate(priv)
+        installed, _ = install_pubkey(args.host, args.user, args.port, auth, pubkey,
+                                       restrict=args.restrict)
+        auth = None
+        if not installed:
+            warn("公钥安装未确认，未登记别名；可用正确登录密码重试。远端已有公钥未撤销。")
+            return 1
+        verified, _ = test_connection(args.host, args.user, args.port, priv, certificate)
+        if not verified:
+            warn("公钥安装后登录验证失败，未登记别名；可用登录密码重新绑定。远端公钥未撤销。")
+            return 1
+        # main() holds the shared mutation lock. Re-read as an extra safeguard for
+        # direct callers and never overwrite a newly-created alias.
+        current = load_state()
+        if name in current["servers"]:
+            warn("同名连接已存在，未覆盖；远端公钥未撤销。")
+            return 1
+        updated = json.loads(json.dumps(current))
+        updated["servers"][name] = _record(name, args.host, args.user, args.port, priv,
+            fingerprint, args.key_type, args.restrict, certificate, "generated", installed=True)
+        config_written = True
+        write_ssh_config(updated["servers"])
+        save_state(updated)
+        committed = True
+        ok("连接已验证并登记：%s" % name)
+        return 0
+    except (Exception, SystemExit):
+        warn("连接创建未完成，请检查凭据、网络与本地存储；远端已有公钥未撤销。")
+        return 1
+    finally:
+        if not committed:
+            # Only delete files created with this attempt's unique name. If a
+            # partial persistence retained a reference, keep its credential.
+            try:
+                latest = load_state()
+                preserve_candidate = any(row.get("key") == owned_paths[0]
+                                         for row in latest["servers"].values())
+                if config_written and not preserve_candidate:
+                    try:
+                        write_ssh_config(latest["servers"])
+                    except (Exception, SystemExit):
+                        preserve_candidate = True
+                        warn("SSH配置恢复失败，已保留本次候选密钥供人工恢复。")
+            except (Exception, SystemExit):
+                preserve_candidate = True
+            if not preserve_candidate:
+                for path in owned_paths:
+                    try:
+                        os.remove(path)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        warn("本次候选密钥清理失败，请检查本地存储权限。")
+
+
 def cmd_add(args):
+    if getattr(args, "require_verified", False):
+        return _cmd_add_verified(args)
     name = args.name
     validate_name(name)
 
@@ -946,6 +1029,7 @@ def _record(name, host, user, port, key, fp, key_type, restrict,
             certificate, source, installed):
     return {
         "name": name, "host": host, "user": user, "port": port,
+        "id": str(uuid.uuid4()), "revision": 1, "sudo_auth": "none", "sudo_credential_ref": None,
         "key": key, "fingerprint": fp, "key_type": key_type,
         "restrict": bool(restrict), "certificate": certificate,
         "source": source, "installed": bool(installed),
@@ -964,6 +1048,8 @@ def cmd_adopt(args):
             pass
     name = args.name
     validate_name(name)
+    if getattr(args, "require_verified", False) and args.force:
+        die("严格验证模式不允许跳过验证")
 
     state = load_state()
     if name in state["servers"] and not args.force:
@@ -1003,6 +1089,9 @@ def cmd_adopt(args):
     if alive:
         ok("验证通过 — %s" % " / ".join(details))
     else:
+        if getattr(args, "require_verified", False):
+            warn("私钥登录验证失败，未登记连接，也未修改提供的私钥。")
+            return 1
         warn("验证未通过：%s" % (details[0] if details else "未知"))
         if not args.force:
             print()
@@ -1418,12 +1507,28 @@ def load_policy_module(required=False):
         return None
 
 
-def _policy_gate_ssh(alias, command):
+def _extension_module(name, required=False):
+    for directory in (bindconsole_lib(), os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "bindconsole")):
+        if os.path.isdir(directory) and directory not in sys.path:
+            sys.path.insert(0, directory)
+    try:
+        return importlib.import_module(name)
+    except Exception:
+        if required:
+            raise _console_fail("扩展内核不可用，请重新安装 BindKit。", "UNSUPPORTED") from None
+        return None
+
+
+def _self_module():
+    return types.SimpleNamespace(**globals())
+
+
+def _policy_gate_ssh(alias, command, context=None):
     mod = load_policy_module()
     if mod is None:
         return None
     try:
-        return mod.gate_ssh(alias, command, requester="ai")
+        return mod.gate_ssh(alias, command, requester="ai", **({"context": context} if context is not None else {}))
     except Exception:                          # noqa: BLE001 —— 闸门绝不抛给主流程
         return {"decision": "deny", "code": "AUTHZ_DENIED",
                 "message": "策略校验内部错误，已按 fail-closed 拒绝",
@@ -1548,6 +1653,10 @@ def _console_ssh_item(name, srv, mod):
         "approval_ttl_s": eff["approval_ttl_s"] if eff else 600,
         "note": policy_entry.get("note"),
         "last_test": None,
+        "id": srv.get("id"), "revision": srv.get("revision", 0),
+        "allowed_users": eff.get("allowed_users", []) if eff else [],
+        "sudo_auth": srv.get("sudo_auth", "none"),
+        "has_sudo_credential": bool(srv.get("sudo_credential_ref")),
     }
 
 
@@ -1585,7 +1694,7 @@ def console_ssh_create(body):
             after = mod.read_policy("ssh")
             if after.get("exists") and not after.get("corrupt"):
                 base = json.loads(json.dumps(before.get("data") or mod.default_policy("ssh")))
-                entry = {k: body[k] for k in ("sudo", "note", "approval_ttl_s") if k in body}
+                entry = {k: body[k] for k in ("sudo", "note", "approval_ttl_s", "allowed_users") if k in body}
                 base.setdefault("servers", {}).setdefault(name, {}).update(entry)
                 expected = _console_clean_ssh_policy(base)
                 # 只恢复本次自己写出的版本，避免覆盖并发发生的其它策略编辑。
@@ -1594,7 +1703,7 @@ def console_ssh_create(body):
                         mod.write_policy("ssh", before["data"])
                     else:
                         os.remove(mod.tool_paths("ssh")["policy"])
-        raise
+        raise _console_fail("创建连接失败，请检查连接信息、凭据与本地存储权限；未撤销远端已有公钥，可用正确密码或私钥重新绑定。", "CONNECTION_CREATE_FAILED") from None
 
 
 def _console_ssh_create(body):
@@ -1617,7 +1726,7 @@ def _console_ssh_create(body):
     state = load_state()
     if name in state["servers"]:
         raise _console_fail("服务器已存在：%s" % name, "CONFLICT")
-    policy_entry = {key: body[key] for key in ("sudo", "note", "approval_ttl_s")
+    policy_entry = {key: body[key] for key in ("sudo", "note", "approval_ttl_s", "allowed_users")
                     if key in body}
     if policy_entry:
         policy_entry = _console_clean_ssh_policy(
@@ -1634,7 +1743,7 @@ def _console_ssh_create(body):
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(private_key if private_key.endswith("\n")
                         else private_key + "\n")
-            rc, out, err = _run_self(["adopt", name, "--host", host, "--user", user,
+            rc, out, err = _run_self(["adopt", name, "--require-verified", "--host", host, "--user", user,
                                       "--port", str(port), "--identity", keyfile])
             adopted = rc == 0
         finally:
@@ -1648,18 +1757,16 @@ def _console_ssh_create(body):
                     except OSError:
                         pass
         if rc != 0:
-            raise _console_fail("导入私钥失败：%s"
-                                % (_last_line(err) or _last_line(out) or "未知错误"))
+            raise _console_fail("导入私钥失败，请检查密钥与连接信息。", "CONNECTION_CREATE_FAILED")
         return {"ok": True, "name": name, "auth": "private_key"}
 
     if isinstance(password, str) and password:
         # 密码导入：走 add --password-stdin（密码走 stdin，不进 argv）
-        rc, out, err = _run_self(["add", name, "--host", host, "--user", user,
+        rc, out, err = _run_self(["add", name, "--require-verified", "--host", host, "--user", user,
                                   "--port", str(port), "--password-stdin"],
                                  stdin_data=password + "\n")
         if rc != 0:
-            raise _console_fail("添加失败：%s"
-                                % (_last_line(err) or _last_line(out) or "未知错误"))
+            raise _console_fail("添加连接失败，请检查登录凭据与网络。", "CONNECTION_CREATE_FAILED")
         return {"ok": True, "name": name, "auth": "password"}
 
     raise _console_fail("需要提供 auth.password 或 auth.private_key")
@@ -1667,43 +1774,82 @@ def _console_ssh_create(body):
 
 def console_ssh_update(name, body):
     name = _console_name(name)
+    if not isinstance(body, dict):
+        raise _console_fail("请求体必须是 JSON 对象")
     state = load_state()
     if name not in state["servers"]:
         raise _console_fail("没有这个服务器：%s" % name, "NOT_FOUND")
-    if not isinstance(body, dict):
-        raise _console_fail("请求体必须是 JSON 对象")
     mod = _console_policy_module()
     current = mod.read_policy("ssh")
-    policy = (current.get("data") or {}) if current.get("exists") and \
-        not current.get("corrupt") else mod.default_policy("ssh")
-    policy.setdefault("servers", {})
-    policy.setdefault("defaults", {})
-    entry = policy["servers"].get(name)
-    if not isinstance(entry, dict):
-        entry = {}
-    changed = []
-    sudo = body.get("sudo")
-    if sudo is not None:
-        sudo = str(sudo).lower()
-        if sudo not in _SSH_SUDO_MODES:
-            raise _console_fail("sudo 策略必须是 allow/ask/deny")
-        entry["sudo"] = sudo
-        changed.append("sudo")
-    if "note" in body:
-        note = body.get("note")
-        entry["note"] = str(note)[:200] if note else None
-        changed.append("note")
-    if "approval_ttl_s" in body and body["approval_ttl_s"] not in (None, ""):
+    if current.get("corrupt"):
+        raise _console_fail("SSH 策略损坏，请先修复策略", "STATE_CORRUPT")
+    policy = json.loads(json.dumps(current.get("data") or mod.default_policy("ssh")))
+    policy_fields = {key: body[key] for key in ("sudo", "note", "approval_ttl_s", "allowed_users") if key in body}
+    # Validate the complete combined request before any credential/network mutation.
+    clean = _console_clean_ssh_policy({"servers": {name: policy_fields}})["servers"][name]
+    credential_fields = {key: body[key] for key in ("host", "user", "port", "login_password", "private_key", "sudo_password", "sudo_auth", "clear_sudo_password") if key in body}
+    result = {"ok": True, "name": name, "changed": []}
+    connections = None
+    if credential_fields:
+        connections = _extension_module("bindkit_connections", required=True)
         try:
-            ttl = int(body["approval_ttl_s"])
-        except (TypeError, ValueError):
-            raise _console_fail("approval_ttl_s 必须是整数")
-        entry["approval_ttl_s"] = max(60, min(86400, ttl))
-        changed.append("approval_ttl_s")
-    if changed:
-        policy["servers"][name] = entry
-        mod.write_policy("ssh", policy)
-    return {"ok": True, "name": name, "changed": changed}
+            connections._validate(state["servers"][name], credential_fields)
+        except connections.ConnectionError as exc:
+            raise _console_fail(str(exc), exc.code) from None
+    if policy_fields:
+        policy.setdefault("servers", {})
+        if not isinstance(policy["servers"].get(name), dict):
+            policy["servers"][name] = {}
+        policy["servers"][name].update(clean)
+        try:
+            mod.write_policy("ssh", policy)
+        except Exception:
+            raise _console_fail("策略保存失败，连接凭据未修改。", "POLICY_UPDATE_FAILED") from None
+    try:
+        if credential_fields:
+            result = connections.update_connection(_self_module(), name, credential_fields)
+    except Exception as exc:
+        if policy_fields:
+            try:
+                latest = mod.read_policy("ssh")
+                if latest.get("data") == policy:
+                    if current.get("exists"):
+                        mod.write_policy("ssh", current["data"])
+                    else:
+                        os.remove(mod.tool_paths("ssh")["policy"])
+            except Exception:
+                raise _console_fail("凭据更新失败且策略恢复失败，请人工检查服务器策略。", "ROLLBACK_FAILED") from None
+        if connections is not None and isinstance(exc, connections.ConnectionError):
+            raise _console_fail(str(exc), exc.code) from None
+        raise _console_fail("连接凭据更新失败，请检查连接与钥匙串状态。", "CONNECTION_UPDATE_FAILED") from None
+    result["changed"].extend(policy_fields)
+    return result
+
+
+def console_ssh_users(name):
+    name = _console_name(name)
+    server = load_state()["servers"].get(name)
+    if not server:
+        raise _console_fail("没有这个服务器", "NOT_FOUND")
+    if not server.get("installed", True) or not os.path.isfile(server.get("key") or ""):
+        raise _console_fail("连接或私钥不可用", "CONNECTION_UNAVAILABLE")
+    command = ssh_with_key(server["host"], server["user"], server["port"], server["key"], server.get("certificate")) + ["getent passwd"]
+    try:
+        rc, out, _ = run_ssh(command, timeout=20)
+    except Exception:
+        raise _console_fail("读取服务器用户失败，请检查连接与 getent 支持。", "USER_DISCOVERY_FAILED") from None
+    if rc or len(out) > 1024 * 1024:
+        raise _console_fail("读取服务器用户失败或结果超出限制。", "USER_DISCOVERY_FAILED")
+    users = []
+    for line in out.splitlines():
+        fields = line.split(":")
+        if len(fields) < 7 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}", fields[0]) or not fields[2].isdigit():
+            continue
+        uid = int(fields[2])
+        users.append({"name": fields[0], "uid": uid, "sensitive": uid < 1000 or fields[0].lower() in ("root", "admin", "administrator", "sudo", "wheel", "nobody")})
+        if len(users) > 5000:
+            raise _console_fail("服务器用户数量超出限制。", "USER_DISCOVERY_FAILED")
+    return {"users": users}
 
 
 def console_ssh_delete(name, body=None):
@@ -1755,6 +1901,12 @@ def console_ssh_policy_get():
     return summary
 
 
+def _clean_allowed_users(value):
+    if not isinstance(value, list) or len(value) > 200 or any(not isinstance(user, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}", user) for user in value):
+        raise _console_fail("allowed_users 必须是有效的用户名称数组（最多200项）")
+    return list(dict.fromkeys(value))
+
+
 def _console_clean_ssh_policy(payload):
     if not isinstance(payload, dict):
         raise _console_fail("策略必须是 JSON 对象")
@@ -1771,6 +1923,8 @@ def _console_clean_ssh_policy(payload):
                                                            int(defaults["approval_ttl_s"])))
         except (TypeError, ValueError):
             raise _console_fail("approval_ttl_s 必须是整数")
+    if "allowed_users" in defaults:
+        out["defaults"]["allowed_users"] = _clean_allowed_users(defaults["allowed_users"])
     servers = payload.get("servers") if isinstance(payload.get("servers"), dict) else {}
     for alias, entry in servers.items():
         alias = _console_name(alias)
@@ -1789,6 +1943,8 @@ def _console_clean_ssh_policy(payload):
                 raise _console_fail("approval_ttl_s 必须是整数（%s）" % alias)
         if "note" in entry:
             clean["note"] = str(entry["note"])[:200] if entry.get("note") else None
+        if "allowed_users" in entry:
+            clean["allowed_users"] = _clean_allowed_users(entry["allowed_users"])
         out["servers"][alias] = clean
     return out
 
@@ -1826,6 +1982,7 @@ def build_console_handlers():
         "update": console_ssh_update,
         "delete": console_ssh_delete,
         "test": console_ssh_test,
+        "users": console_ssh_users,
         "policy_get": console_ssh_policy_get,
         "policy_put": console_ssh_policy_put,
     }
@@ -1930,54 +2087,112 @@ def start_console_mode(argv):
 
 
 def cmd_exec(args):
-    """在远端执行一条命令。专为自动化/agent 设计：
-       强制 BatchMode（失败即报错，绝不卡在密码提示）、透传远端退出码、可选 JSON 输出。"""
+    """Preserve legacy execution, with managed identity and authentication when requested."""
     state = load_state()
-    s = state["servers"].get(args.name)
-    if not s:
+    server = state["servers"].get(args.name)
+    if not server:
         die("没有名为 %s 的绑定。先执行 sshbind list 看看有哪些" % args.name)
-    if not os.path.exists(s["key"]):
-        die("私钥缺失，无法连接：%s" % s["key"])
-
+    if not os.path.exists(server["key"]):
+        die("私钥缺失，无法连接：%s" % server["key"])
     command = " ".join(args.command).strip()
     if not command:
-        die("请给出要执行的命令，例如：sshbind exec %s 'df -h'" % args.name)
-
-    # REMAINDER 会把别名之后的选项也吞进来，这里挡住这种误用（否则会静默执行错命令）
-    misplaced = [t for t in args.command if t in ("--json", "--timeout")]
+        die("请给出要执行的命令")
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        words = args.command
+    misplaced = [token for token in args.command if token in ("--json", "--timeout", "--as-user", "--stdin")]
+    misplaced += [token for token in words if token == "--as-user" or token.startswith("--as-user=")]
     if misplaced:
-        die("选项必须写在别名之前，例如：\n"
-            "    sshbind exec --json %s '你的命令'\n"
-            "  检测到被当成命令一部分的选项：%s" % (args.name, " ".join(misplaced)))
-
-    # bindconsole 策略闸门（CONTRACT §8.2）：取到 command 后、建连前判定
-    gate = _policy_gate_ssh(args.name, command)
+        die("选项必须写在别名之前，例如 sshbind exec --as-user app --json 别名 '命令'")
+    stdin_data = None
+    if getattr(args, "stdin", False):
+        source = getattr(sys.stdin, "buffer", sys.stdin)
+        stdin_data = source.read(8 * 1024 * 1024 + 1)
+        if len(stdin_data) > 8 * 1024 * 1024:
+            die("标准输入超过8MiB限制")
+    privilege = _extension_module("bindkit_privilege")
+    orchestration = _extension_module("bindkit_orchestration")
+    plan = None; context = None; mod = load_policy_module()
+    if getattr(args, "as_user", None) and (privilege is None or orchestration is None):
+        return _emit_gate_ssh(args, {"decision": "deny", "code": "UNSUPPORTED_PRIVILEGE", "message": "受管身份功能不可用，请重新安装 BindKit。"}, command)
+    managed_enabled = bool(getattr(args, "as_user", None) or server.get("sudo_auth") in ("keyring", "nopasswd"))
+    if privilege is not None and managed_enabled:
+        try:
+            raw = mod.read_policy("ssh") if mod else {}
+            effective = mod.effective_ssh_policy(raw.get("data") or {}, args.name) if mod else {}
+            plan = privilege.build_plan(command, server["user"], as_user=getattr(args, "as_user", None), allowed_users=effective.get("allowed_users", []))
+            if plan.get("unsupported"):
+                return _emit_gate_ssh(args, {"decision": "deny", "code": "UNSUPPORTED_PRIVILEGE", "message": "复杂或交互式提权不受支持；请用 --as-user 指定身份与非交互命令。"}, command)
+            if plan.get("managed"):
+                def resolve_uid(target):
+                    identity = target[1:] if target.startswith("#") else target
+                    query = ssh_with_key(server["host"], server["user"], server["port"], server["key"], server.get("certificate")) + ["id -u -- " + shlex.quote(identity)]
+                    rc, out, _ = run_ssh(query, timeout=min(20, args.timeout))
+                    return int(out.strip()) if rc == 0 and re.fullmatch(r"[0-9]{1,10}", out.strip()) else None
+                plan = privilege.build_plan(command, server["user"], as_user=getattr(args, "as_user", None), allowed_users=effective.get("allowed_users", []), uid_resolver=resolve_uid)
+                if orchestration is None:
+                    raise ValueError("missing orchestration")
+                context = dict(plan, connection=orchestration.connection_context(server))
+        except Exception:
+            return _emit_gate_ssh(args, {"decision": "deny", "code": "AUTHZ_DENIED", "message": "执行身份校验失败，已拒绝执行。"}, command)
+    if context is None and orchestration is not None and mod is not None and mod.is_sudo_command(command)[0]:
+        context = {"connection": orchestration.connection_context(server), "managed": False,
+                   "target_user": None, "target_uid": None, "approval_exempt": False}
+    gate = _policy_gate_ssh(args.name, command, context=context)
+    if gate and gate.get("decision") == "ask" and mod and orchestration:
+        review_context = {"policy_revision": mod.policy_revision("ssh"),
+            "operation": "as_user" if getattr(args, "as_user", None) else "sudo",
+            "resource": {"alias": args.name, "host": server["host"], "port": server["port"], "user": server["user"]},
+            "target_user": (plan or {}).get("target_user"), "target_uid": (plan or {}).get("target_uid"),
+            "effective_level": "sudo", "hard_allowed": True,
+            "protected": orchestration.protected_operation(command), "command": command}
+        gate = orchestration.review_gate("ssh", gate, review_context, mod,
+            lambda: _policy_gate_ssh(args.name, command, context=context))
     if gate and gate.get("decision") in ("deny", "ask"):
         return _emit_gate_ssh(args, gate, command)
-
-    # 注意：远端 .bashrc 的噪音（nvm / locale 之类）会打在 stderr 上，且无法从客户端屏蔽
-    # （bash 检测到 stdin 来自网络连接时就会读 ~/.bashrc，早于我们的命令执行）。
-    # 好消息是 stdout 是干净的，所以脚本读 stdout、或直接用 --json 就能准确取值。
-    remote_cmd = command
-
-    cmd = ssh_with_key(s["host"], s["user"], s["port"], s["key"],
-                       s.get("certificate")) + [remote_cmd]
-    t0 = time.time()
-    rc, out, err = run_ssh(cmd, timeout=args.timeout)
+    started = None; managed_result = None; t0 = time.time()
+    if plan and plan.get("managed"):
+        try:
+            latest = load_state()["servers"].get(args.name)
+            if not latest or orchestration.connection_context(latest) != context["connection"]:
+                started = False
+                managed_result = {"exit_code": 5, "stdout": "", "stderr": "", "started": False, "authenticated": False,
+                    "error": {"code": "CONNECTION_CHANGED", "message": "连接已变化，请重新提交命令以重新审核。"}}
+            else:
+                vault_module = _extension_module("bindkit_vault", required=True)
+                managed_result = privilege.execute_plan(_self_module(), server, plan, vault_module.Vault(), stdin_data=stdin_data, timeout=args.timeout)
+                started = managed_result.get("started")
+        except Exception:
+            managed_result = {"exit_code": 255, "stdout": "", "stderr": "", "started": None, "authenticated": False,
+                "error": {"code": "EXECUTION_STATE_UNKNOWN", "message": "无法确认执行状态，请勿自动重试。"}}
+        finally:
+            if gate and gate.get("approval_lease"):
+                try:
+                    mod.finish_approval("ssh", gate["consumed_approval"], gate["approval_lease"], started=started)
+                except Exception:
+                    # Never replay when lease persistence fails after an execution attempt.
+                    if managed_result is None:
+                        managed_result = {"exit_code": 255, "stdout": "", "stderr": "", "started": None, "authenticated": False}
+                    managed_result["error"] = {"code": "APPROVAL_FINALIZATION_FAILED", "message": "执行占用保存失败，请人工检查执行结果，勿自动重试。"}
+                    managed_result["exit_code"] = 255
+        rc, out, err = managed_result["exit_code"], managed_result["stdout"], managed_result["stderr"]
+    else:
+        cmd = ssh_with_key(server["host"], server["user"], server["port"], server["key"], server.get("certificate")) + [command]
+        rc, out, err = run_ssh(cmd, timeout=args.timeout, **({"stdin_data": stdin_data} if stdin_data is not None else {}))
     ms = int((time.time() - t0) * 1000)
-
     if args.json:
-        print(json.dumps({
-            "alias": args.name, "host": s["host"], "user": s["user"],
-            "command": command, "exit_code": rc,
-            "stdout": out, "stderr": err, "duration_ms": ms,
-        }, ensure_ascii=False, indent=2))
-        return rc if 0 <= rc <= 255 else 1
-
-    if out:
-        sys.stdout.write(out)
-    if err:
-        sys.stderr.write(err)
+        envelope = {"alias": args.name, "host": server["host"], "user": server["user"], "command": command,
+                    "exit_code": rc, "stdout": out, "stderr": err, "duration_ms": ms}
+        if managed_result:
+            envelope.update({key: managed_result.get(key) for key in ("started", "authenticated", "error")})
+            envelope["target_user"] = plan["target_user"]
+        print(json.dumps(envelope, ensure_ascii=False, indent=2))
+    else:
+        if out: sys.stdout.write(out)
+        if err: sys.stderr.write(err)
+        if managed_result and managed_result.get("error"):
+            sys.stderr.write(managed_result["error"]["code"] + ": " + managed_result["error"]["message"] + "\n")
     return rc if 0 <= rc <= 255 else 1
 
 
@@ -2057,6 +2272,7 @@ def build_parser():
     a.add_argument("--restrict", action="store_true",
                    help="在远端给公钥加 restrict 前缀（禁用端口转发/pty 等）")
     a.add_argument("--force", action="store_true", help="覆盖同名绑定")
+    a.add_argument("--require-verified", action="store_true", help=argparse.SUPPRESS)
     add_auth_args(a)
     a.set_defaults(func=cmd_add)
 
@@ -2072,6 +2288,7 @@ def build_parser():
     ad.add_argument("--password-stdin", action="store_true",
                     help="从标准输入首行读密码（控制台统一入口用；adopt 用密钥验证，不消费密码）")
     ad.add_argument("--force", action="store_true", help="验证失败也强行登记")
+    ad.add_argument("--require-verified", action="store_true", help=argparse.SUPPRESS)
     ad.set_defaults(func=cmd_adopt)
 
     l = sub.add_parser("list", help="列出所有绑定")
@@ -2082,6 +2299,8 @@ def build_parser():
     ex.add_argument("--json", action="store_true",
                     help="以 JSON 输出（含 exit_code / stdout / stderr / duration_ms）")
     ex.add_argument("--timeout", type=int, default=120, help="超时秒数（默认 120）")
+    ex.add_argument("--as-user", help="通过受管 sudo 以指定身份执行")
+    ex.add_argument("--stdin", action="store_true", help="将标准输入送给远端命令（最多8MiB）")
     ex.add_argument("name", help="服务器别名")
     ex.add_argument("command", nargs=argparse.REMAINDER,
                     help="要执行的命令（选项须写在别名之前）")
@@ -2152,6 +2371,11 @@ def main(argv=None):
         return 0
     ensure_dirs()
     try:
+        if args.cmd in ("add", "adopt", "remove", "import"):
+            connections = _extension_module("bindkit_connections")
+            if connections is not None:
+                with connections._lock(_self_module()):
+                    return args.func(args)
         return args.func(args)
     except KeyboardInterrupt:
         print()

@@ -20,7 +20,7 @@ import tarfile
 import tempfile
 import urllib.request
 
-VERSION = '1.0.0'
+VERSION = '1.1.0'
 REPOSITORY = 'isle24/bindkit'
 
 

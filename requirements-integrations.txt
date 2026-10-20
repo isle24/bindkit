@@ -1,0 +1,7 @@
+# Optional isolated runtime only; core BindKit has no third-party dependencies.
+# Verified against official PyPI project metadata on 2026-10-21.
+# OpenAI 2.48.0 is the last non-yanked release declaring Python >=3.9;
+# newer OpenAI versions require >=3.10, while BindKit supports Python 3.9+.
+# Keyring 25.7.0 declares Python >=3.9 and selects the OS keychain backend.
+keyring==25.7.0
+openai==2.48.0

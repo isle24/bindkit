@@ -26,6 +26,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import tempfile
 import time
 from datetime import datetime, timedelta
@@ -375,7 +376,9 @@ def effective_ssh_policy(raw, alias):
         mode = DEFAULT_SDO
     ttl = _clamp_ttl(entry.get("approval_ttl_s", defaults.get("approval_ttl_s",
                                                              DEFAULT_TTL_S)))
-    return {"sudo": mode, "approval_ttl_s": ttl}
+    users = entry.get("allowed_users", defaults.get("allowed_users", []))
+    users = [str(x) for x in users] if isinstance(users, list) else []
+    return {"sudo": mode, "approval_ttl_s": ttl, "allowed_users": users}
 
 
 def effective_db_policy(raw, alias):
@@ -1059,7 +1062,7 @@ def fingerprint(tool, alias, action, target):
 
 
 class _ApprovalLock(object):
-    """审批目录的跨进程互斥锁（fcntl.flock）。拿不到锁时降级为无锁（仍原子写）。"""
+    """审批目录的跨进程互斥锁；不可用时禁止决定或消费审批。"""
 
     def __init__(self, tool):
         self.tool = tool
@@ -1067,16 +1070,15 @@ class _ApprovalLock(object):
         self.fd = None
 
     def __enter__(self):
+        _ensure_dir(_approvals_dir(self.tool), 0o700)
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
         try:
-            _ensure_dir(_approvals_dir(self.tool), 0o700)
-            self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
-            try:
-                import fcntl
-                fcntl.flock(self.fd, fcntl.LOCK_EX)
-            except (ImportError, OSError):
-                pass
-        except OSError:
+            import fcntl
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+        except (ImportError, OSError) as exc:
+            os.close(self.fd)
             self.fd = None
+            raise OSError("审批锁不可用，已拒绝操作") from exc
         return self
 
     def __exit__(self, *exc):
@@ -1114,13 +1116,9 @@ def _is_expired(ap, now=None):
 
 
 def _refresh_expired_quietly(tool, ap):
-    """过期的 pending/approved 惰性落盘为 expired（失败静默）。"""
-    if ap.get("status") in ("pending", "approved") and _is_expired(ap):
-        ap["status"] = "expired"
-        try:
-            _save_approval(tool, ap)
-        except OSError:
-            pass
+    """计算过期状态；无锁读取不得覆盖并发的人类/AI决定或执行占用。"""
+    if ap.get("status") in ("pending", "approved") and not ap.get("execution_lease") and _is_expired(ap):
+        ap = dict(ap, status="expired")
     return ap
 
 
@@ -1235,7 +1233,22 @@ def _create_approval(tool, alias, action, target, fp, ttl_s, requester, note=Non
     return ap
 
 
-def approve(tool, approval_id, consumes=1, ttl_s=600, note=None, decided_by="web"):
+def policy_revision(tool):
+    """Content revision used to invalidate decisions when authorization changes."""
+    pol = read_policy(tool)
+    raw = json.dumps(pol.get("data"), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _validate_decision_context(tool, ap, expected_fingerprint, expected_policy_revision):
+    if expected_fingerprint is not None and ap.get("fingerprint") != expected_fingerprint:
+        raise ValueError("审批请求上下文已变化")
+    if expected_policy_revision is not None and policy_revision(tool) != expected_policy_revision:
+        raise ValueError("授权策略已变化，请重新审核")
+
+
+def approve(tool, approval_id, consumes=1, ttl_s=600, note=None, decided_by="web",
+            expected_fingerprint=None, expected_policy_revision=None):
     """批准一张 pending 单（原子写、并发安全：重复批准只生效一次）。
 
     ttl_s 语义：expires_at = 批准时刻 + ttl_s（覆盖建单时的过期时间）。
@@ -1254,6 +1267,7 @@ def approve(tool, approval_id, consumes=1, ttl_s=600, note=None, decided_by="web
         ap = get_approval(tool, approval_id)
         if not ap:
             raise ValueError("审批单不存在：%s" % approval_id)
+        _validate_decision_context(tool, ap, expected_fingerprint, expected_policy_revision)
         if ap.get("status") != "pending":
             raise ValueError("审批单状态不是 pending（当前 %s），不能批准"
                              % ap.get("status"))
@@ -1267,13 +1281,14 @@ def approve(tool, approval_id, consumes=1, ttl_s=600, note=None, decided_by="web
         if note is not None:
             ap["note"] = _truncate(redact(note))
         _save_approval(tool, ap)
-    audit(tool, "web", ap.get("alias"), ap.get("action"), "approve",
+    audit(tool, ap["decided_by"], ap.get("alias"), ap.get("action"), "approve",
           request_id=ap.get("id"), target=ap.get("target"),
           note="consumes=%s ttl=%ss" % (consumes, ttl))
     return ap
 
 
-def reject(tool, approval_id, note=None, decided_by="web"):
+def reject(tool, approval_id, note=None, decided_by="web",
+           expected_fingerprint=None, expected_policy_revision=None):
     """拒绝一张 pending 单（原子写、并发安全）。返回更新后的审批单全字段 dict。"""
     if tool not in ("ssh", "db"):
         raise ValueError("tool 必须是 ssh 或 db：%r" % (tool,))
@@ -1281,6 +1296,7 @@ def reject(tool, approval_id, note=None, decided_by="web"):
         ap = get_approval(tool, approval_id)
         if not ap:
             raise ValueError("审批单不存在：%s" % approval_id)
+        _validate_decision_context(tool, ap, expected_fingerprint, expected_policy_revision)
         if ap.get("status") != "pending":
             raise ValueError("审批单状态不是 pending（当前 %s），不能拒绝"
                              % ap.get("status"))
@@ -1289,26 +1305,66 @@ def reject(tool, approval_id, note=None, decided_by="web"):
         ap["decided_by"] = decided_by if decided_by in ("ai", "web") else "web"
         ap["note"] = _truncate(redact(note)) if note else None
         _save_approval(tool, ap)
-    audit(tool, "web", ap.get("alias"), ap.get("action"), "reject",
+    audit(tool, ap["decided_by"], ap.get("alias"), ap.get("action"), "reject",
           request_id=ap.get("id"), target=ap.get("target"), note=note)
     return ap
 
 
-def _ask_or_allow(tool, alias, action, target, ttl_s, requester, message, hint_prefix):
+def finish_approval(tool, approval_id, lease_id, started):
+    """Finish one reserved execution. Only a proven pre-start failure restores its use."""
+    with _ApprovalLock(tool):
+        ap = get_approval(tool, approval_id)
+        lease = (ap or {}).get("execution_lease") or {}
+        if not lease_id or not secrets.compare_digest(str(lease.get("id", "")), str(lease_id)):
+            raise ValueError("执行占用无效或已结束")
+        ap.pop("execution_lease", None)
+        if started is False and ap.get("status") == "approved" and not _is_expired(ap):
+            ap["consumes_left"] = int(ap.get("consumes_left", 0)) + 1
+            decision = "release"
+        else:
+            decision = "consume"
+            if int(ap.get("consumes_left", 0)) <= 0:
+                ap["status"] = "consumed"
+                ap["consumed_at"] = _iso(_now())
+        _save_approval(tool, ap)
+    audit(tool, "ai", ap.get("alias"), ap.get("action"), decision,
+          request_id=approval_id, target=ap.get("target"),
+          note="execution_started=%s" % ("unknown" if started is None else str(started).lower()))
+    return ap
+
+
+def _ask_or_allow(tool, alias, action, target, ttl_s, requester, message, hint_prefix,
+                  reserve=False):
     """审批流公共部分：命中已批准单→消费放行；否则复用/新建 pending 并返回 ask。"""
     now = _now()
     fp = fingerprint(tool, alias, action, target)
     try:
         with _ApprovalLock(tool):
+            if reserve:
+                for active in iter_approvals(tool):
+                    if active.get("fingerprint") == fp and active.get("execution_lease"):
+                        return {"decision": "ask", "code": "APPROVAL_REQUIRED",
+                                "request_id": active["id"], "expires_at": active["expires_at"],
+                                "message": "相同请求正在执行，请等待执行结果", "busy": True,
+                                "hint": "不要重复提交；当前请求已有执行占用"}
             approved = _find_approved_for(tool, fp, now)
             if approved:
-                ap = _consume_approval(tool, approved)
-                audit(tool, requester, alias, action, "consume",
+                if reserve:
+                    ap = approved
+                    ap["consumes_left"] = int(ap.get("consumes_left", 0)) - 1
+                    ap["execution_lease"] = {"id": secrets.token_hex(16), "created_at": _iso(now)}
+                    _save_approval(tool, ap)
+                else:
+                    ap = _consume_approval(tool, approved)
+                audit(tool, requester, alias, action, "reserve" if reserve else "consume",
                       request_id=ap.get("id"), target=target,
                       note="consumes_left=%s" % ap.get("consumes_left"))
-                return {"decision": "allow",
+                result = {"decision": "allow",
                         "consumed_approval": ap.get("id"),
                         "consumes_left": ap.get("consumes_left")}
+                if reserve:
+                    result["approval_lease"] = ap["execution_lease"]["id"]
+                return result
             pending = _find_pending_for(tool, fp, now)
             if pending:
                 ap = pending
@@ -1341,7 +1397,7 @@ def _deny(code, message, hint=None):
     return {"decision": "deny", "code": code, "message": message, "hint": hint}
 
 
-def gate_ssh(alias, command, requester="ai"):
+def gate_ssh(alias, command, requester="ai", context=None):
     """ssh 命令闸门。**绝不抛异常**；返回 §8.1 的三种 dict 之一。
 
     无 policy.json → allow（完全维持原行为，不写审计，零副作用）。
@@ -1360,6 +1416,23 @@ def gate_ssh(alias, command, requester="ai"):
         sudo, word = is_sudo_command(command)
         policy = effective_ssh_policy(pol["data"], alias)
         mode = policy["sudo"]
+        target = command
+        if context is not None:
+            target = json.dumps({"version": 2, "command": command,
+                "connection": context.get("connection"), "target_user": context.get("target_user"),
+                "target_uid": context.get("target_uid"), "managed": bool(context.get("managed")),
+                "policy_revision": policy_revision("ssh")}, sort_keys=True,
+                separators=(",", ":"), ensure_ascii=False)
+            ordinary = context.get("target_uid")
+            exempt = context.get("approval_exempt") is True \
+                and isinstance(ordinary, int) and not isinstance(ordinary, bool) and ordinary > 0 \
+                and context.get("target_user") in policy["allowed_users"]
+            if exempt:
+                audit("ssh", requester, alias, "switch_user", "allow", target=target,
+                      note="允许列表内的普通身份")
+                return {"decision": "allow"}
+            if context.get("managed") or context.get("target_uid") == 0:
+                sudo, word = True, "target_identity"
         if not sudo:
             audit("ssh", requester, alias, "exec", "allow", target=command,
                   note="非提权命令")
@@ -1378,10 +1451,11 @@ def gate_ssh(alias, command, requester="ai"):
                         "sudo 策略改为 ask 或 allow" % word)
         # ask
         return _ask_or_allow(
-            "ssh", alias, action, command, policy["approval_ttl_s"], requester,
+            "ssh", alias, action, target, policy["approval_ttl_s"], requester,
             "检测到提权关键字（%s），该操作需要人工审批（服务器 %s）"
             % (word, alias),
-            "打开 http://127.0.0.1:8790 审批后重试同一命令")
+            "打开 http://127.0.0.1:8790 审批后重试同一命令",
+            reserve=bool(context and context.get("managed")))
     except Exception as e:                     # noqa: BLE001 —— 闸门绝不抛异常
         try:
             audit("ssh", requester, alias, "exec", "error", target=command,
@@ -1497,7 +1571,7 @@ def policy_warnings(engine, policy):
 
 
 def gate_db(alias, sql, engine, default_db, requested_write=False,
-            requested_unsafe=False, requester="ai"):
+            requested_unsafe=False, requester="ai", context=None):
     """数据库 SQL 闸门。**绝不抛异常**；返回 §8.1 的三种 dict 之一。
 
     无 policy.json → allow（完全维持原行为，不写审计，零副作用）。
@@ -1554,7 +1628,11 @@ def gate_db(alias, sql, engine, default_db, requested_write=False,
                 result["warnings"] = hints      # 易用性提示，不影响放行
             return result
         # 同一 SQL 在不同库有不同副作用，审批必须同时绑定引擎与实际默认库。
-        approval_target = json.dumps({"engine": engine, "database": default_db, "sql": sql},
+        identity = {"engine": engine, "database": default_db, "sql": sql}
+        if context is not None:
+            identity.update(connection=context.get("connection"), operation=context.get("operation"),
+                            policy_revision=policy_revision("db"), version=2)
+        approval_target = json.dumps(identity,
                                      ensure_ascii=False, sort_keys=True)
         return _ask_or_allow(
             "db", alias, required, approval_target, policy["approval_ttl_s"], requester,
@@ -1640,6 +1718,7 @@ __all__ = [
     "effective_ssh_policy", "effective_db_policy", "policy_summary",
     "fingerprint", "list_approvals", "get_approval", "approve", "reject",
     "iter_approvals", "read_audit", "tool_paths", "policy_present",
+    "policy_revision", "finish_approval",
     "policy_warnings", "AUDIT_LOG",
     "BINDCONSOLE_HOME", "LEVELS", "LEVEL_RANK",
 ]

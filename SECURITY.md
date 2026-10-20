@@ -1,6 +1,6 @@
 # Security policy
 
-Supported release: 1.0.x. See [security model](docs/security-model.md) before using policy gates.
+Supported release: 1.1.x. See [security model](docs/security-model.md) before using policy gates.
 
 Report a suspected vulnerability privately through the repository's GitHub **Security → Report a vulnerability**
 when available. Do not paste real credentials, private keys, connection state or production logs into issues.

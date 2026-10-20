@@ -154,6 +154,47 @@
     });
   }
 
+  function showFormError(error, err) {
+    error.show(err);
+    error.el.setAttribute('role', 'alert');
+    if (typeof error.el.scrollIntoView === 'function') error.el.scrollIntoView({ block: 'nearest' });
+  }
+
+  // Selected values survive searching and a temporarily unavailable discovery endpoint.
+  function searchableChoices(initial, testid) {
+    var selected = Object.create(null);
+    (initial || []).forEach(function (name) { selected[String(name)] = true; });
+    var choices = [];
+    var search = UI.textInput({ placeholder: '搜索名称', testid: testid + '-search' });
+    search.setAttribute('aria-label', '搜索名称');
+    var list = UI.el('div', { 'class': 'choice-list', 'data-testid': testid });
+    function draw() {
+      UI.clear(list);
+      var known = Object.create(null);
+      choices.forEach(function (item) { known[item.name] = true; });
+      var all = choices.concat(Object.keys(selected).filter(function (name) { return !known[name]; }).map(function (name) {
+        return { name: name, label: name + '（已保存，暂未发现）' };
+      }));
+      var filtered = all.filter(function (item) { return String(item.label || item.name).toLowerCase().indexOf(search.value.toLowerCase()) >= 0; });
+      if (!filtered.length) list.appendChild(UI.el('p', { 'class': 'field-help', text: choices.length ? '没有匹配项' : '暂无可选项' }));
+      filtered.forEach(function (item) {
+        var checkbox = UI.checkboxInput(item.label || item.name, { checked: !!selected[item.name] });
+        checkbox.input.disabled = !!item.disabled && !selected[item.name];
+        checkbox.input.addEventListener('change', function () {
+          if (checkbox.input.checked) selected[item.name] = true; else delete selected[item.name];
+        });
+        list.appendChild(checkbox.wrap);
+      });
+    }
+    search.addEventListener('input', draw);
+    draw();
+    return {
+      el: UI.el('div', { 'class': 'choice-picker' }, [search, list]),
+      values: function () { return Object.keys(selected).sort(); },
+      update: function (items) { choices = items; draw(); }
+    };
+  }
+
   /* ================================================================
    * 认证页
    * ================================================================ */
@@ -361,6 +402,10 @@
       usableReason: raw.usable_reason || raw.reason || '',
       hasKey: raw.has_key === true || !!raw.key_path,
       hasPassword: raw.has_password === true,
+      sudoAuth: raw.sudo_auth || 'none',
+      hasSudoCredential: raw.has_sudo_credential === true,
+      keychain: raw.keychain || {},
+      allowedUsers: raw.allowed_users || [],
       fingerprint: raw.fingerprint || '',
       keyPath: raw.key_path || '',
       sudo: (sudo === 'allow' || sudo === 'ask' || sudo === 'deny') ? sudo : 'ask',
@@ -386,6 +431,7 @@
       sub: '管理 sshbind 别名：导入密码或私钥、配置 sudo 提权审批策略、测试连通性。',
       actions: [
         UI.button({ label: '刷新', variant: 'ghost', small: true, testid: 'btn-refresh', onClick: function () { load(false); } }),
+        UI.button({ label: '导入连接', testid: 'btn-import', onClick: function () { openImportConnections(function () { return load(false); }); } }),
         UI.button({ label: '添加服务器', variant: 'primary', testid: 'btn-add', onClick: function () { openAddServer(); } })
       ]
     });
@@ -476,7 +522,7 @@
         },
         {
           label: 'sudo 策略',
-          render: function (row) { return sudoBadge(row.server.sudo); }
+          render: function (row) { return UI.el('div', {}, [sudoBadge(row.server.sudo), UI.el('div', { 'class': 'field-help', text: row.server.sudoAuth === 'keyring' ? (row.server.hasSudoCredential ? '钥匙串凭据已设置' : '钥匙串凭据未设置') : (row.server.sudoAuth === 'nopasswd' ? 'NOPASSWD' : '未配置认证') })]); }
         },
         {
           label: '最近测试',
@@ -490,7 +536,11 @@
             var testBtn = UI.btnLink('测试', { testid: 'test-' + s.name });
             testBtn.addEventListener('click', function () { runTest(s, row, testBtn); });
             var editBtn = UI.btnLink('编辑', { testid: 'edit-' + s.name });
-            editBtn.addEventListener('click', function () { openEditServer(s); });
+            editBtn.addEventListener('click', function () {
+              if (editBtn.disabled) return;
+              editBtn.disabled = true; editBtn.textContent = '加载中…';
+              openEditServer(s).then(function () { editBtn.disabled = false; editBtn.textContent = '编辑'; });
+            });
             var delBtn = UI.btnLink('删除', { danger: true, testid: 'delete-' + s.name });
             delBtn.addEventListener('click', function () { deleteServer(s); });
             return UI.el('span', {}, [testBtn, editBtn, delBtn]);
@@ -580,8 +630,10 @@
       authPassword.addEventListener('change', syncAuth);
       authKey.addEventListener('change', syncAuth);
 
-      UI.openFormModal({
+      function clearSecrets() { password.value = ''; privateKey.value = ''; }
+      var addApi = UI.openFormModal({
         title: '添加服务器',
+        onClose: clearSecrets,
         subtitle: '凭证只写不读：提交后立即清空输入框，接口与页面都不会回显。',
         submitLabel: '添加',
         body: [
@@ -623,11 +675,6 @@
           if (authKey.checked) bodyData.private_key = privateKey.value.trim();
           else bodyData.password = password.value;
 
-          function clearSecrets() {
-            password.value = '';
-            privateKey.value = '';
-          }
-
           return net.post('/api/servers', bodyData).then(function () {
             clearSecrets();
             api.close();
@@ -639,55 +686,101 @@
           });
         }
       });
+      app().registerCleanup(function () { addApi.close(); });
     }
 
     function openEditServer(server) {
-      var subtitleParts = [server.user + '@' + server.host + ':' + server.port];
-      if (server.source) subtitleParts.push('来源 ' + server.source);
-      if (server.hasKey) subtitleParts.push('密钥认证');
-      else if (server.hasPassword) subtitleParts.push('密码认证');
+      return net.get(resourcePath(server.name)).then(function (data) {
+        if (!app().isCurrent(ctx.epoch)) return;
+        showEditServer(normalizeServer(data.server || data));
+      }).catch(function (err) { UI.errorToast(err); });
+    }
 
-      var sudo = UI.selectInput({
-        name: 'sudo', testid: 'f-sudo', value: server.sudo,
-        options: [
-          { value: 'allow', label: 'allow — 直接放行' },
-          { value: 'ask', label: 'ask — 需要审批（默认）' },
-          { value: 'deny', label: 'deny — 一律拒绝' }
-        ]
+    function showEditServer(server) {
+      var host = UI.textInput({ value: server.host, testid: 'f-host' });
+      var user = UI.textInput({ value: server.user, testid: 'f-user' });
+      var port = UI.textInput({ type: 'number', value: server.port, min: '1', max: '65535', testid: 'f-port' });
+      var loginPassword = UI.textInput({ type: 'password', autocomplete: 'new-password', placeholder: '留空不修改', testid: 'f-login-password' });
+      var privateKey = UI.textareaInput({ rows: 4, placeholder: '粘贴新私钥；留空不修改', testid: 'f-private-key' });
+      var sudo = UI.selectInput({ name: 'sudo', testid: 'f-sudo', value: server.sudo, options: [
+        { value: 'allow', label: 'allow — 直接放行' }, { value: 'ask', label: 'ask — 需要审批' }, { value: 'deny', label: 'deny — 一律拒绝' }
+      ] });
+      var sudoAuth = UI.selectInput({ value: server.sudoAuth, testid: 'f-sudo-auth', options: [
+        { value: 'none', label: '未配置 sudo 认证' }, { value: 'keyring', label: '系统钥匙串密码' }, { value: 'nopasswd', label: '远端已配置 NOPASSWD' }
+      ] });
+      var sudoPassword = UI.textInput({ type: 'password', autocomplete: 'new-password', placeholder: '留空保留已存密码', testid: 'f-sudo-password' });
+      var clearSudo = UI.checkboxInput('清除已保存的 sudo 密码', { testid: 'f-clear-sudo-password' });
+      var keychain = server.keychain;
+      var status = UI.el('div', { 'class': keychain.available ? 'field-help' : 'warn-banner', text:
+        (server.hasSudoCredential ? 'sudo 密码已保存。' : '尚未保存 sudo 密码。') +
+        (keychain.available ? ' 系统钥匙串可用' + (keychain.backend ? '：' + keychain.backend : '') : ' 系统钥匙串不可用：' + (keychain.reason || '请安装或解锁钥匙串后重试') + '。可运行 bash install.sh --with-integrations 安装集成依赖。')
       });
-      var ttl = UI.textInput({
-        type: 'number', min: '60', max: '86400',
-        value: server.approvalTtl === null ? '' : String(server.approvalTtl),
-        placeholder: '留空 = 使用默认（600 秒）', testid: 'f-approval-ttl'
-      });
-      var note = UI.textareaInput({ rows: 3, value: server.note, testid: 'f-note' });
-
-      UI.openFormModal({
+      sudoPassword.disabled = !keychain.available;
+      var users = searchableChoices(server.allowedUsers, 'f-allowed-users');
+      var usersStatus = UI.el('div', { 'class': 'field-help', 'aria-live': 'polite' });
+      var discover = UI.button({ label: '刷新远端账号', small: true, testid: 'f-discover-users', onClick: discoverUsers });
+      function discoverUsers() {
+        if (discover.disabled) return;
+        discover.disabled = true;
+        usersStatus.textContent = '正在发现远端账号…';
+        net.get(resourcePath(server.name, 'users')).then(function (data) {
+          if (formApi.modal.isClosed()) return;
+          var found = listOf(data, 'users');
+          users.update(found.map(function (item) {
+            var protectedUser = item.sensitive !== false || !Number.isInteger(Number(item.uid)) || Number(item.uid) <= 0;
+            return { name: item.name, label: item.name + ' · UID ' + item.uid + (protectedUser ? ' · 敏感账号，仍需审批' : ''), disabled: protectedUser };
+          }));
+          usersStatus.textContent = found.length ? '只选择可信的普通账号；敏感或无法解析的身份仍需审批。' : '没有发现可选账号。可刷新重试，已保存选择会保留。';
+        }).catch(function (err) {
+          if (!formApi.modal.isClosed()) usersStatus.textContent = '发现账号失败：' + err.message + '。请检查连接后重试；已保存选择保留。';
+        }).then(function () { discover.disabled = false; });
+      }
+      var ttl = UI.textInput({ type: 'number', min: '60', max: '86400', value: server.approvalTtl === null ? '' : String(server.approvalTtl), placeholder: '留空使用默认', testid: 'f-approval-ttl' });
+      var note = UI.textareaInput({ rows: 2, value: server.note, testid: 'f-note' });
+      function clearSecrets() { loginPassword.value = ''; privateKey.value = ''; sudoPassword.value = ''; }
+      function invalid(message) { clearSecrets(); return { message: message }; }
+      var formApi = UI.openFormModal({
         title: '编辑服务器 · ' + server.name,
-        subtitle: subtitleParts.join(' · '),
+        subtitle: '别名保持不变。凭据只写不读，留空不修改；替换前会验证连接。',
         submitLabel: '保存',
+        onClose: clearSecrets,
         body: [
-          UI.field('sudo 策略', sudo),
-          UI.field('审批有效期（秒）', ttl, { help: '留空 = 使用策略默认值；范围 60–86400。' }),
-          UI.field('备注', note)
+          UI.el('div', { 'class': 'form-grid' }, [UI.field('主机', host, { required: true }), UI.field('端口', port)]),
+          UI.field('SSH 登录用户', user, { required: true }),
+          UI.field('SSH 登录密码', loginPassword, { help: '仅用来重新绑定 SSH 密钥，不修改远端账户密码。它与 sudo 提权密码独立；密码和私钥只填写一种。' }),
+          UI.field('替换 SSH 私钥', privateKey, { help: '仅粘贴密钥内容。验证通过后才替换；原密钥不会自动吊销。' }),
+          UI.el('h3', { 'class': 'section-title', text: 'sudo 提权' }), status,
+          UI.field('sudo 策略', sudo), UI.field('sudo 认证', sudoAuth),
+          UI.field('sudo 密码', sudoPassword, { help: '仅保存到系统钥匙串，不会回填。NOPASSWD 需要在远端预先配置。' }), clearSudo.wrap,
+          UI.field('允许免身份审批的普通账号', users.el), discover, usersStatus,
+          UI.field('审批有效期（秒）', ttl, { help: '留空使用默认值；范围 60–86400。' }), UI.field('备注', note)
         ],
         validate: function () {
-          if (ttl.value.trim() !== '') {
-            var v = parseInt(ttl.value, 10);
-            if (!(v >= 60 && v <= 86400)) return { message: '审批有效期需在 60–86400 秒之间（或留空）' };
-          }
+          if (!host.value.trim() || !user.value.trim()) return invalid('主机和 SSH 登录用户不能为空');
+          if (!(Number(port.value) >= 1 && Number(port.value) <= 65535 && Number.isInteger(Number(port.value)))) return invalid('端口需为 1–65535 的整数');
+          if (loginPassword.value && privateKey.value.trim()) return invalid('SSH 登录密码和新私钥请只填写一种');
+          if (clearSudo.input.checked && sudoPassword.value) return invalid('不能同时设置和清除 sudo 密码');
+          if (ttl.value.trim() && !(Number(ttl.value) >= 60 && Number(ttl.value) <= 86400 && Number.isInteger(Number(ttl.value)))) return invalid('审批有效期需在 60–86400 秒之间');
           return null;
         },
         onSubmit: function (api) {
-          var bodyData = { sudo: sudo.value, note: note.value.trim() };
-          if (ttl.value.trim() !== '') bodyData.approval_ttl_s = parseInt(ttl.value, 10);
+          var bodyData = { host: host.value.trim(), user: user.value.trim(), port: Number(port.value), sudo: sudo.value, sudo_auth: sudoAuth.value, allowed_users: users.values(), note: note.value.trim() };
+          if (ttl.value.trim()) bodyData.approval_ttl_s = Number(ttl.value);
+          if (loginPassword.value) bodyData.login_password = loginPassword.value;
+          if (privateKey.value.trim()) bodyData.private_key = privateKey.value.trim();
+          if (sudoPassword.value) bodyData.sudo_password = sudoPassword.value;
+          if (clearSudo.input.checked) bodyData.clear_sudo_password = true;
           return net.put(resourcePath(server.name), bodyData).then(function () {
-            api.close();
-            UI.successToast('已保存 ' + server.name);
-            return load(false);
+            api.close(); UI.successToast('已保存 ' + server.name); return load(false);
+          }).then(function () { clearSecrets(); }, function (err) { clearSecrets(); throw err; }).then(function () {
+            delete bodyData.login_password; delete bodyData.private_key; delete bodyData.sudo_password;
+          }, function (err) {
+            delete bodyData.login_password; delete bodyData.private_key; delete bodyData.sudo_password; throw err;
           });
         }
       });
+      app().registerCleanup(function () { formApi.close(); });
+      discoverUsers();
     }
 
     function deleteServer(server) {
@@ -1522,91 +1615,79 @@
   function auditPage(view, ctx) {
     var pageRoot = UI.el('div');
     view.appendChild(pageRoot);
-
-    var head = UI.pageHeader({
-      title: '审计',
-      sub: '两个工具共写的操作记录（~/.bindconsole/audit.log）。按时间倒序，绝不记录密码与私钥。'
-    });
+    var head = UI.pageHeader({ title: '审计', sub: '两个工具的操作记录，按时间倒序。翻页保留同一快照，刷新获取新记录。' });
     pageRoot.appendChild(head.el);
-
-    var decisionSelect = UI.selectInput({
-      name: 'decision', testid: 'audit-decision', value: '',
-      options: [
-        { value: '', label: '全部决策' },
-        { value: 'allow', label: 'allow' },
-        { value: 'deny', label: 'deny' },
-        { value: 'ask', label: 'ask' },
-        { value: 'approve', label: 'approve' },
-        { value: 'reject', label: 'reject' },
-        { value: 'consume', label: 'consume' },
-        { value: 'error', label: 'error' }
-      ]
-    });
-    var toolSelect = UI.selectInput({
-      name: 'tool', testid: 'audit-tool', value: '',
-      options: [
-        { value: '', label: '当前控制台' },
-        { value: 'all', label: '全部工具' }
-      ]
-    });
-    var limitSelect = UI.selectInput({
-      name: 'limit', testid: 'audit-limit', value: '100',
-      options: [
-        { value: '50', label: '50 条' },
-        { value: '100', label: '100 条' },
-        { value: '200', label: '200 条' },
-        { value: '500', label: '500 条' }
-      ]
-    });
-    var refreshBtn = UI.button({ label: '刷新', variant: 'ghost', small: true, testid: 'btn-refresh', onClick: function () { load(true); } });
-
-    var filterBar = UI.el('div', { 'class': 'filter-bar' }, [
-      UI.el('label', { 'class': 'field-label', 'for': decisionSelect.id, text: '决策' }),
-      decisionSelect,
-      UI.el('label', { 'class': 'field-label', 'for': toolSelect.id, text: '工具' }),
-      toolSelect,
-      UI.el('label', { 'class': 'field-label', 'for': limitSelect.id, text: '条数' }),
-      limitSelect,
-      UI.el('span', { 'class': 'filter-spacer' }),
-      refreshBtn
+    var decisionSelect = UI.selectInput({ testid: 'audit-decision', value: '', options: [
+      { value: '', label: '全部决策' }
+    ].concat(['allow', 'deny', 'ask', 'approve', 'reject', 'consume', 'error'].map(function (value) { return { value: value, label: value }; })) });
+    var toolSelect = UI.selectInput({ testid: 'audit-tool', value: state().tool, options: [
+      { value: 'all', label: '全部工具' }, { value: 'ssh', label: 'SSH' }, { value: 'db', label: '数据库' }
+    ] });
+    var sizeSelect = UI.selectInput({ testid: 'audit-page-size', value: '50', options: [25, 50, 100, 200].map(function (n) { return { value: String(n), label: n + ' 条 / 页' }; }) });
+    var actor = UI.textInput({ placeholder: '操作者', testid: 'audit-actor' });
+    var alias = UI.textInput({ placeholder: '连接别名', testid: 'audit-alias' });
+    var refreshBtn = UI.button({ label: '刷新', variant: 'ghost', small: true, testid: 'btn-refresh', onClick: reset });
+    var applyBtn = UI.button({ label: '筛选', type: 'submit', testid: 'audit-apply' });
+    var filters = UI.el('form', { 'class': 'filter-bar audit-filters' }, [
+      UI.field('工具', toolSelect), UI.field('决策', decisionSelect), UI.field('操作者', actor), UI.field('别名', alias), applyBtn, refreshBtn
     ]);
-    pageRoot.appendChild(filterBar);
-
-    var body = UI.el('div');
-    pageRoot.appendChild(body);
-
-    var loading = false;
-
-    function load(initial) {
-      if (loading) return Promise.resolve();
-      loading = true;
-      var query = {
-        limit: limitSelect.value,
-        decision: decisionSelect.value,
-        tool: toolSelect.value || undefined
-      };
-      var hadEntries = body.querySelector('table') !== null;
-      if (initial && !hadEntries) {
-        UI.clear(body);
-        body.appendChild(UI.loadingBlock('正在加载审计…'));
-      }
-      return net.get('/api/audit', query).then(function (data) {
-        if (!app().isCurrent(ctx.epoch)) return;
-        render(listOf(data, 'entries').map(normalizeAudit));
-      }).catch(function (err) {
-        if (!app().isCurrent(ctx.epoch)) return;
-        if (initial) {
-          UI.clear(body);
-          body.appendChild(UI.errorBlock(err, function () { load(true); }));
-        }
-      }).then(function () {
-        loading = false;
-      });
+    filters.addEventListener('submit', function (e) { e.preventDefault(); reset(); });
+    pageRoot.appendChild(filters);
+    var error = UI.formError(); pageRoot.appendChild(error.el);
+    var notice = UI.el('p', { 'class': 'field-help', 'aria-live': 'polite' }); pageRoot.appendChild(notice);
+    var body = UI.el('div'); pageRoot.appendChild(body);
+    var page = 1, snapshot = '', sequence = 0, loading = false;
+    var applied = { tool: state().tool, decision: '', actor: '', alias: '', page_size: 50 };
+    var metadata = { page: 1, pages: 0, total: 0, has_prev: false, has_next: false };
+    var prev = UI.button({ label: '上一页', testid: 'audit-prev', onClick: function () { if (!loading && metadata.has_prev) { page--; load(false); } } });
+    var next = UI.button({ label: '下一页', testid: 'audit-next', onClick: function () { if (!loading && metadata.has_next) { page++; load(false); } } });
+    var jump = UI.textInput({ type: 'number', value: '1', min: '1', testid: 'audit-page' });
+    jump.setAttribute('aria-label', '页码');
+    var pageInfo = UI.el('span', { 'class': 'pagination-info', 'data-testid': 'audit-page-info', 'aria-live': 'polite' });
+    var jumpButton = UI.button({ label: '跳转', small: true, type: 'submit', testid: 'audit-jump' });
+    var pager = UI.el('form', { 'class': 'pagination' }, [prev, pageInfo, next, UI.el('div', { 'class': 'pagination-jump' }, [jump, jumpButton]), UI.field('每页', sizeSelect)]);
+    pager.addEventListener('submit', function (e) {
+      e.preventDefault(); if (loading) return;
+      var value = Number(jump.value);
+      if (!Number.isInteger(value) || value < 1 || value > Math.max(1, metadata.pages)) { error.show({ message: '请输入有效页码' }); return; }
+      page = value; load(false);
+    });
+    pageRoot.appendChild(pager);
+    function updatePager() {
+      prev.disabled = loading || !metadata.has_prev;
+      next.disabled = loading || !metadata.has_next;
+      jump.disabled = loading; jumpButton.disabled = loading; refreshBtn.disabled = loading;
+      jump.value = String(metadata.page || 1); jump.max = String(Math.max(1, metadata.pages));
+      pageInfo.textContent = '第 ' + (metadata.pages ? metadata.page : 0) + ' / ' + metadata.pages + ' 页 · 共 ' + metadata.total + ' 条';
     }
-
+    function reset() {
+      applied = { tool: toolSelect.value, decision: decisionSelect.value, actor: actor.value.trim(), alias: alias.value.trim(), page_size: Number(sizeSelect.value) };
+      page = 1; snapshot = ''; notice.textContent = ''; return load(true);
+    }
+    function load(initial, recovered) {
+      var request = ++sequence;
+      loading = true; updatePager(); error.hide();
+      var query = { page: page, page_size: applied.page_size, tool: applied.tool, decision: applied.decision, actor: applied.actor, alias: applied.alias };
+      if (snapshot) query.snapshot = snapshot;
+      if (initial && !body.children.length) body.appendChild(UI.loadingBlock('正在加载审计…'));
+      return net.get('/api/audit', query).then(function (data) {
+        if (!app().isCurrent(ctx.epoch) || request !== sequence) return;
+        metadata = data; page = data.page; snapshot = data.snapshot || '';
+        head.setCount(data.total); render(listOf(data, 'entries').map(normalizeAudit));
+      }).catch(function (err) {
+        if (!app().isCurrent(ctx.epoch) || request !== sequence) return;
+        if (!recovered && (err.status === 409 || err.status === 413) && snapshot) {
+          snapshot = ''; page = 1; notice.textContent = '审计快照已失效，已返回第一页获取最新记录。';
+          return load(true, true);
+        }
+        page = metadata.page || 1;
+        if (body.querySelector('[data-testid="state-loading"]')) UI.clear(body);
+        error.show(err);
+      }).then(function () { if (request === sequence) { loading = false; updatePager(); } });
+    }
     function render(entries) {
       UI.clear(body);
-      head.setCount(entries.length);
+
       if (!entries.length) {
         body.appendChild(emptyPage('暂无审计记录', '当 AI 或控制台执行操作、触发审批时，这里会出现记录。'));
         return;
@@ -1669,12 +1750,337 @@
       body.appendChild(table.el);
     }
 
-    [decisionSelect, toolSelect, limitSelect].forEach(function (control) {
-      control.addEventListener('change', function () { load(true); });
-    });
+    [decisionSelect, toolSelect, sizeSelect].forEach(function (control) { control.addEventListener('change', reset); });
+    app().registerSilentRefresher(function () { if (!loading) return load(false); });
+    updatePager(); load(true);
+  }
 
-    app().registerSilentRefresher(function () { return load(false); });
-    load(true);
+  function openImportConnections(onImported) {
+    var files = UI.el('input', { type: 'file', multiple: true, accept: '.xsh,.zip,.xts,.json,.config,.conf,config', 'class': 'input', 'data-testid': 'import-files' });
+    var format = UI.selectInput({ value: 'auto', testid: 'import-format', options: [
+      { value: 'auto', label: '自动识别' }, { value: 'xshell', label: 'Xshell' }, { value: 'finalshell', label: 'FinalShell' }, { value: 'openssh', label: 'OpenSSH config' }
+    ] });
+    var error = UI.formError();
+    var source = UI.el('div', { 'class': 'form' }, [UI.field('格式', format), UI.field('连接文件（可多选）', files, { help: '支持 .xsh、普通 ZIP、FinalShell JSON 与 OpenSSH config，总大小不超过 700 KiB。受保护的 .xts 容器可能需要重新导出为单独 .xsh 或普通 ZIP。' })]);
+    var previewArea = UI.el('div');
+    var status = UI.el('p', { 'class': 'field-help', 'aria-live': 'polite', 'data-testid': 'import-status' });
+    var rows = [], preview = null, busy = false;
+    var previewBtn = UI.button({ label: '预览连接', testid: 'import-preview', onClick: previewFiles });
+    var commitBtn = UI.button({ label: '导入所选连接', variant: 'primary', testid: 'import-commit', disabled: true, onClick: commit });
+    var closeBtn = UI.button({ label: '关闭', variant: 'ghost', onClick: function () { modal.close(); } });
+    var modal = UI.openModal({
+      title: '导入连接', subtitle: '只迁移连接信息。加密密码不会恢复，登录凭据需自行补充；不会覆盖已有连接。',
+      body: [error.el, source, status, previewArea], footer: [closeBtn, previewBtn, commitBtn],
+      onClose: function () { clearSecrets(); files.value = ''; preview = null; rows = []; }
+    });
+    app().registerCleanup(function () { modal.close(); });
+    function clearSecrets() {
+      rows.forEach(function (row) { row.password.value = ''; row.key.value = ''; });
+      if (bulkPassword) bulkPassword.value = '';
+      if (bulkKey) bulkKey.value = '';
+    }
+    function setBusy(flag) {
+      busy = flag; previewBtn.disabled = flag; closeBtn.disabled = flag;
+      files.disabled = flag; format.disabled = flag;
+      commitBtn.disabled = flag || !preview || !rows.some(function (row) { return !row.done; });
+      if (bulkApply) bulkApply.disabled = flag;
+      rows.forEach(function (row) { [row.selected, row.name, row.user, row.password, row.key].forEach(function (field) { field.disabled = flag || row.done; }); });
+    }
+    function readFile(file) {
+      return new Promise(function (resolve, reject) {
+        var reader = new FileReader();
+        reader.onload = function () { resolve({ name: file.name, content: String(reader.result).split(',')[1] || '' }); };
+        reader.onerror = function () { reject({ message: '无法读取文件：' + file.name }); };
+        reader.readAsDataURL(file);
+      });
+    }
+    function previewFiles() {
+      if (busy) return;
+      error.hide();
+      var selectedFiles = Array.prototype.slice.call(files.files || []);
+      if (!selectedFiles.length) { showFormError(error, { message: '请先选择连接文件' }); return; }
+      if (selectedFiles.reduce(function (sum, file) { return sum + file.size; }, 0) > 700 * 1024) {
+        showFormError(error, { message: '文件总大小超过 700 KiB，请减少文件或分批导入' }); return;
+      }
+      clearSecrets(); preview = null; rows = []; UI.clear(previewArea); setBusy(true); status.textContent = '正在读取并预览连接…';
+      Promise.all(selectedFiles.map(readFile)).then(function (payload) {
+        if (modal.isClosed()) return null;
+        return net.post('/api/imports/preview', { format: format.value, files: payload });
+      }).then(function (data) {
+        if (!data || modal.isClosed()) return;
+        preview = data; files.value = ''; renderPreview(data);
+      }).catch(function (err) {
+        if (!modal.isClosed()) { clearSecrets(); showFormError(error, err); status.textContent = '预览失败，文件未导入。可以更换格式或文件后重试。'; }
+      }).then(function () { if (!modal.isClosed()) setBusy(false); });
+    }
+    var bulkPassword, bulkKey, bulkApply;
+    function renderPreview(data) {
+      UI.clear(previewArea); rows = [];
+      var items = listOf(data, 'items');
+      var expiresAt = typeof data.expires_at === 'number' ? new Date(data.expires_at < 1e12 ? data.expires_at * 1000 : data.expires_at).toISOString() : data.expires_at;
+      status.textContent = '发现 ' + items.length + ' 条连接。预览有效期至 ' + UI.fmtDateTime(expiresAt) + '；勾选条目后补充登录凭据。';
+      (data.warnings || []).forEach(function (warning) { previewArea.appendChild(UI.el('div', { 'class': 'warn-banner', text: warning })); });
+      if (!items.length) { previewArea.appendChild(emptyPage('没有可导入的连接', '请检查格式，或导出为单独 .xsh、普通 ZIP、FinalShell JSON 或 OpenSSH config。')); return; }
+      bulkPassword = UI.textInput({ type: 'password', autocomplete: 'new-password', testid: 'import-bulk-password', placeholder: '用于所选条目的 SSH 登录密码' });
+      bulkKey = UI.textareaInput({ rows: 3, testid: 'import-bulk-key', placeholder: '或粘贴用于所选条目的私钥内容' });
+      bulkApply = UI.button({ label: '应用到所选条目', small: true, testid: 'import-bulk-apply', onClick: function () {
+        if (busy) return;
+        if (bulkPassword.value && bulkKey.value.trim()) { showFormError(error, { message: '批量登录密码与私钥只能填写一种' }); return; }
+        var targets = rows.filter(function (row) { return row.selected.checked && !row.done; });
+        if (!targets.length) { showFormError(error, { message: '请先勾选连接' }); return; }
+        if (!bulkPassword.value && !bulkKey.value.trim()) { showFormError(error, { message: '请填写批量登录密码或私钥' }); return; }
+        targets.forEach(function (row) { row.password.value = bulkPassword.value; row.key.value = bulkKey.value.trim(); });
+        bulkPassword.value = ''; bulkKey.value = ''; error.hide();
+        status.textContent = '已为 ' + targets.length + ' 条所选连接补充凭据，请检查后导入。';
+      } });
+      var bulk = UI.el('details', { 'class': 'import-bulk' }, [UI.el('summary', { text: '批量补充同一份登录凭据' }), UI.el('div', { 'class': 'form mt-16' }, [UI.field('SSH 登录密码', bulkPassword), UI.field('私钥内容', bulkKey), bulkApply])]);
+      previewArea.appendChild(bulk);
+      var selectAll = UI.checkboxInput('选择全部未导入连接', { checked: true, testid: 'import-select-all' });
+      selectAll.input.addEventListener('change', function () { if (!busy) rows.forEach(function (row) { if (!row.done) row.selected.checked = selectAll.input.checked; }); });
+      previewArea.appendChild(selectAll.wrap);
+      items.forEach(function (item, index) {
+        var selected = UI.checkboxInput('导入此连接', { checked: true, testid: 'import-select-' + index });
+        var name = UI.textInput({ value: item.name, testid: 'import-name-' + index });
+        var user = UI.textInput({ value: item.user || '', placeholder: '请明确填写 SSH 登录用户', testid: 'import-user-' + index });
+        var password = UI.textInput({ type: 'password', autocomplete: 'new-password', placeholder: '填写登录密码，或使用下方私钥', testid: 'import-password-' + index });
+        var key = UI.textareaInput({ rows: 3, placeholder: '粘贴私钥内容；不会读取导出文件中的密钥路径', testid: 'import-key-' + index });
+        var outcome = UI.el('div', { 'class': 'import-outcome', 'aria-live': 'polite', 'data-testid': 'import-result-' + index });
+        var row = { id: item.id, name: name, user: user, selected: selected.input, password: password, key: key, outcome: outcome, done: false };
+        rows.push(row);
+        var section = UI.el('section', { 'class': 'import-item' }, [
+          UI.el('div', { 'class': 'import-item-head' }, [UI.el('h3', { 'class': 'section-title', text: (item.user || '未指定用户') + '@' + item.host + ':' + item.port }), selected.wrap]),
+          UI.el('p', { 'class': 'field-help', text: '来源 ' + item.source + ' · 认证 ' + item.auth_type + (item.key_hint ? ' · 密钥提示 ' + item.key_hint : '') + (item.requires_credentials ? ' · 需要补充登录凭据' : '') }),
+          UI.field('导入别名', name), UI.field('SSH 登录用户', user, { required: true, help: '请核对目标身份；导出文件未提供用户时必须补充，不会默认使用 root。' }), UI.field('SSH 登录密码', password), UI.field('私钥内容', key), outcome
+        ]);
+        (item.warnings || []).forEach(function (warning) { section.appendChild(UI.el('p', { 'class': 'field-help', text: warning })); });
+        previewArea.appendChild(section);
+      });
+    }
+    function commit() {
+      if (busy || !preview) return;
+      error.hide();
+      var selected = rows.filter(function (row) { return row.selected.checked && !row.done; });
+      if (!selected.length) { showFormError(error, { message: '请至少选择一条尚未导入的连接' }); return; }
+      var names = Object.create(null), validation = '';
+      var items = selected.map(function (row) {
+        var name = row.name.value.trim();
+        var user = row.user.value.trim();
+        if (!/^[A-Za-z_][A-Za-z0-9_.@\\-]{0,127}$/.test(user)) validation = '请为连接 ' + name + ' 填写合法的 SSH 登录用户';
+        if (!/^[A-Za-z0-9_.-]+$/.test(name) || name.indexOf('..') >= 0) validation = '别名只能包含字母、数字、点、下划线、连字符，且不能含 ..';
+        if (names[name]) validation = '所选条目的别名重复：' + name;
+        names[name] = true;
+        if (row.password.value && row.key.value.trim()) validation = '连接 ' + name + ' 的登录密码和私钥只需填写一种';
+        if (!row.password.value && !row.key.value.trim()) validation = '请为连接 ' + name + ' 补充 SSH 登录密码或私钥';
+        var item = { id: row.id, name: name, user: user, sudo: 'ask' };
+        if (row.key.value.trim()) item.private_key = row.key.value.trim(); else item.login_password = row.password.value;
+        return item;
+      });
+      if (validation) { items.forEach(function (item) { delete item.login_password; delete item.private_key; }); showFormError(error, { message: validation }); return; }
+      setBusy(true); status.textContent = '正在验证凭据并导入，请勿重复提交…';
+      net.post('/api/imports/commit', { preview_id: preview.preview_id, items: items }).then(function (data) {
+        if (modal.isClosed()) { if (data.imported && onImported) return onImported(); return; }
+        var results = listOf(data, 'results');
+        selected.forEach(function (row) {
+          var result = results.filter(function (entry) { return entry.id === row.id; })[0];
+          if (result && result.ok === true) {
+            row.done = true; row.selected.checked = false;
+            row.outcome.textContent = '已导入：' + result.name; row.outcome.className = 'import-outcome flag-yes';
+          } else {
+            row.outcome.textContent = '导入失败：' + (result && result.error || '未收到该条目的结果，请检查连接列表后重试');
+            row.outcome.className = 'import-outcome flag-no';
+          }
+        });
+        status.textContent = '导入成功 ' + data.imported + ' 条，失败 ' + data.failed + ' 条。失败条目的别名和选择已保留，重新补充凭据后可重试。';
+        if (data.imported && onImported) return onImported();
+      }).catch(function (err) {
+        if (!modal.isClosed()) { showFormError(error, err); status.textContent = '导入请求失败。连接信息已保留，请检查列表与错误信息，再补充凭据重试。'; }
+      }).then(function () {
+        clearSecrets(); items.forEach(function (item) { delete item.login_password; delete item.private_key; });
+        if (!modal.isClosed()) setBusy(false);
+      });
+    }
+  }
+
+  function aiPage(view, ctx) {
+    var head = UI.pageHeader({ title: 'AI 审批', sub: '仅对指定别名处理审批，现有权限与硬性拒绝始终生效。关闭此页面后，后台审批服务会继续运行。' });
+    head.setCount(null); view.appendChild(head.el);
+    var root = UI.el('div'); view.appendChild(root);
+    var config = null, alive = true, busy = false;
+    var controls = [], apiKey, clearKey, mode, baseUrl, model, ttl, scope, serviceStatus, serviceText;
+    var error = UI.formError(), message = UI.el('p', { 'class': 'field-help', 'aria-live': 'polite', 'data-testid': 'ai-message' });
+    app().registerCleanup(function () { alive = false; if (apiKey) apiKey.value = ''; });
+    function current() { return alive && app().isCurrent(ctx.epoch); }
+    function requestStatus() {
+      return net.get('/api/ai/service/status').then(function (status) {
+        if (!current()) return;
+        serviceStatus = status;
+        serviceText.textContent = status.running === true ? '后台服务运行中' + (status.pid ? ' · PID ' + status.pid : '') : '后台服务已停止';
+      }, function (err) {
+        serviceStatus = null;
+        if (current() && serviceText) serviceText.textContent = '服务状态查询失败：' + err.message;
+        throw err;
+      });
+    }
+    function run(label, action) {
+      if (busy || !current()) return Promise.resolve();
+      busy = true; error.hide(); message.textContent = label + '…';
+      controls.forEach(function (button) { button.disabled = true; });
+      return Promise.resolve().then(action).catch(function (err) {
+        if (current()) { showFormError(error, err); message.textContent = ''; }
+      }).then(function () {
+        if (apiKey) apiKey.value = '';
+        if (clearKey) clearKey.input.checked = false;
+        busy = false;
+        if (current()) controls.forEach(function (button) { button.disabled = false; });
+      });
+    }
+    function addButton(label, testid, fn, variant) {
+      var button = UI.button({ label: label, testid: testid, variant: variant, onClick: fn }); controls.push(button); return button;
+    }
+    function readAliases() {
+      return net.get('/api/' + state().resource).then(function (data) {
+        if (!current()) return;
+        var aliases = listOf(data, state().resource).map(function (item) { return item.name || item.alias; }).filter(Boolean);
+        scope.update(aliases.map(function (name) { return { name: name }; }));
+        return aliases.length ? '选择允许 AI 审批的连接；未选连接继续人工审批。' : '当前工具还没有连接。请先添加连接，再刷新别名。';
+      });
+    }
+    // Read the latest config before every write so another console's scopes survive.
+    function save(forcedMode) {
+      var desired = {
+        mode: forcedMode || mode.value, base_url: baseUrl.value.trim(), model: model.value.trim(), ttl_s: Number(ttl.value),
+        scopes: scope.values(), api_key: apiKey.value, clear_api_key: clearKey.input.checked
+      };
+      if (!Number.isInteger(desired.ttl_s) || desired.ttl_s < 60 || desired.ttl_s > 300) return Promise.reject({ message: 'AI 审批有效期需为 60–300 秒的整数' });
+      if (desired.api_key && desired.clear_api_key) return Promise.reject({ message: '不能同时设置和清除 API Key' });
+      return net.get('/api/ai/config').then(function (latest) {
+        var scopes = { ssh: (latest.scopes && latest.scopes.ssh || []).slice(), db: (latest.scopes && latest.scopes.db || []).slice() };
+        scopes[state().tool] = desired.scopes;
+        var body = { mode: desired.mode, base_url: desired.base_url, model: desired.model, ttl_s: desired.ttl_s, scopes: scopes };
+        if (desired.api_key) body.api_key = desired.api_key;
+        if (desired.clear_api_key) body.clear_api_key = true;
+        desired.api_key = '';
+        return net.put('/api/ai/config', body).then(function (result) {
+          delete body.api_key; return result;
+        }, function (err) { delete body.api_key; throw err; });
+      }).then(function () {
+        return net.get('/api/ai/config');
+      }).then(function (saved) {
+        config = saved;
+        if (current()) {
+          mode.value = saved.mode;
+          keyStatus.textContent = saved.has_api_key ? 'API Key 已保存，内容不会回显。' : '尚未保存 API Key。';
+        }
+        if (desired.mode === 'off') {
+          return net.post('/api/ai/service/stop', {}).then(requestStatus).then(function () {
+            if (serviceStatus && serviceStatus.running) throw { message: '配置已关闭，但后台服务仍在运行，请重试停止服务' };
+          });
+        }
+      }).then(function () { if (current()) message.textContent = desired.mode === 'off' ? '已保存关闭模式，后台服务已停止。' : '配置已保存。需要持续处理时，请启动后台服务。'; });
+    }
+    var keyStatus;
+    function draw(data) {
+      config = data;
+      UI.clear(root);
+      mode = UI.selectInput({ value: config.mode || 'off', testid: 'ai-mode', options: [
+        { value: 'off', label: '关闭' }, { value: 'suggest', label: '建议 — 仍由人工决定' }, { value: 'auto', label: '自动审批 — 仅指定别名' }
+      ] });
+      baseUrl = UI.textInput({ value: config.base_url || '', placeholder: 'https://api.example.com/v1', testid: 'ai-base-url' });
+      model = UI.textInput({ value: config.model || '', placeholder: '输入模型名称，或从获取结果中选择', testid: 'ai-model' });
+      ttl = UI.textInput({ type: 'number', value: config.ttl_s || 120, min: '60', max: '300', testid: 'ai-ttl' });
+      apiKey = UI.textInput({ type: 'password', autocomplete: 'new-password', placeholder: '留空保留已存密钥', testid: 'ai-api-key' });
+      clearKey = UI.checkboxInput('清除已保存的 API Key', { testid: 'ai-clear-api-key' });
+      keyStatus = UI.el('div', { 'class': 'field-help', text: config.has_api_key ? 'API Key 已保存，内容不会回显。' : '尚未保存 API Key。' });
+      scope = searchableChoices((config.scopes && config.scopes[state().tool]) || [], 'ai-scopes');
+      var scopeHelp = UI.el('p', { 'class': 'field-help', 'aria-live': 'polite', text: '正在加载连接别名…' });
+      var modelChoices = UI.selectInput({ testid: 'ai-model-options', value: '', options: [{ value: '', label: '先获取模型列表（也可直接输入）' }] });
+      modelChoices.disabled = true;
+      modelChoices.setAttribute('aria-label', '可选模型列表');
+      modelChoices.addEventListener('change', function () { if (modelChoices.value) model.value = modelChoices.value; });
+      serviceText = UI.el('p', { 'class': 'service-state', 'data-testid': 'ai-service-state', 'aria-live': 'polite', text: '正在查询后台服务…' });
+      var missing = config.sdk_available !== true || !config.vault || config.vault.available !== true;
+      var dependencyNote = UI.el('div', { 'class': missing ? 'warn-banner' : 'field-help', text: missing
+        ? 'AI 集成尚不可用：' + (config.sdk_available !== true ? '缺少模型 SDK。' : '') + (!config.vault || !config.vault.available ? '系统钥匙串不可用：' + (config.vault && config.vault.reason || '请安装或解锁系统钥匙串') + '。' : '') + ' 请运行 bash install.sh --with-integrations。'
+        : '模型 SDK 与系统钥匙串可用。仅脱敏后的审批内容会发送至模型服务。' });
+      var saveOff = addButton('保存连接（关闭模式）', 'ai-save-connection', function () { run('保存连接', function () { return save('off'); }); });
+      var saveConfig = addButton('保存设置', 'ai-save', function () { run('保存设置', function () { return save(); }); }, 'primary');
+      var test = addButton('测试已保存连接', 'ai-test', function () {
+        run('测试连接', function () { return net.post('/api/ai/test', {}).then(function (result) {
+          if (result.connected !== true) throw { message: result.error || result.message || '模型连接测试失败' };
+          message.textContent = result.message || '模型连接测试成功。';
+        }); });
+      });
+      var models = addButton('获取已保存连接的模型', 'ai-models', function () {
+        run('获取模型', function () { return net.get('/api/ai/models').then(function (data) {
+          if (!current()) return;
+          if (data.error) throw { message: data.error, hint: data.message || '' };
+          UI.clear(modelChoices);
+          modelChoices.appendChild(UI.el('option', { value: '', text: '选择模型，或直接输入名称' }));
+          var items = listOf(data, 'models');
+          items.forEach(function (name) { modelChoices.appendChild(UI.el('option', { value: name, text: name })); });
+          modelChoices.disabled = !items.length;
+          message.textContent = items.length ? '已获取 ' + items.length + ' 个模型。选择后保存设置。' : '服务未返回模型列表，可直接输入支持的模型名称。';
+        }); });
+      });
+      var start = addButton('启动后台服务', 'ai-start', function () {
+        run('启动后台服务', function () { return net.get('/api/ai/config').then(function (latest) {
+          if (latest.mode === 'off') throw { message: '请先保存建议或自动审批模式，再启动后台服务' };
+          if (!latest.sdk_available || !latest.vault || !latest.vault.available) throw { message: 'AI 集成不可用，请运行 bash install.sh --with-integrations 并确认系统钥匙串已解锁' };
+          if (!latest.has_api_key || !latest.model) throw { message: '请先保存 API Key 与模型名称' };
+          return net.post('/api/ai/service/start', {});
+        }).then(requestStatus).then(function () {
+          if (!serviceStatus || serviceStatus.running !== true) throw { message: '后台服务尚未启动，请检查依赖和已保存配置' };
+          message.textContent = '后台服务已启动，关闭页面后仍会继续处理。';
+        }); });
+      });
+      var stop = addButton('停止后台服务', 'ai-stop', function () {
+        run('停止后台服务', function () { return net.post('/api/ai/service/stop', {}).then(requestStatus).then(function () {
+          if (!serviceStatus || serviceStatus.running !== false) throw { message: '未能确认后台服务已停止，请重试' };
+          message.textContent = '后台服务已停止。保存的审批模式未改变。';
+        }); });
+      });
+      var disable = addButton('关闭自动审批并停止服务', 'ai-disable', function () {
+        run('关闭自动审批', function () {
+          return net.get('/api/ai/config').then(function (latest) {
+            return net.put('/api/ai/config', { mode: 'off', base_url: latest.base_url, model: latest.model, ttl_s: latest.ttl_s, scopes: { ssh: latest.scopes && latest.scopes.ssh || [], db: latest.scopes && latest.scopes.db || [] } });
+          }).then(function () {
+            if (current()) mode.value = 'off';
+            return net.post('/api/ai/service/stop', {});
+          }).then(requestStatus).then(function () {
+            if (!serviceStatus || serviceStatus.running !== false) throw { message: '配置已关闭，但尚未确认服务停止，请重试停止服务' };
+            if (current()) message.textContent = 'AI 审批已关闭，后台服务已停止。';
+          });
+        });
+      });
+      var refreshStatus = addButton('刷新服务状态', 'ai-refresh-status', function () { run('查询服务状态', function () { return requestStatus().then(function () { message.textContent = '服务状态已更新。'; }); }); });
+      var refreshAliases = addButton('刷新别名', 'ai-refresh-aliases', function () { run('加载连接别名', function () { return readAliases().then(function (hint) { scopeHelp.textContent = hint; message.textContent = '连接别名已更新。'; }); }); });
+      var connection = UI.el('section', { 'class': 'settings-section' }, [
+        UI.el('h2', { 'class': 'section-title', text: '模型连接' }), dependencyNote,
+        UI.field('API 地址', baseUrl), UI.field('API Key', apiKey, { help: '密钥仅写入系统钥匙串；保存、出错或离开页面后会清空输入框。' }), keyStatus, clearKey.wrap,
+        UI.field('模型', model), modelChoices,
+        UI.el('p', { 'class': 'field-help', text: '首次配置先保存连接（关闭模式），再测试或获取模型。服务不支持列出模型时，可直接输入名称。' }),
+        UI.el('div', { 'class': 'settings-actions' }, [saveOff, test, models])
+      ]);
+      var policy = UI.el('section', { 'class': 'settings-section' }, [
+        UI.el('h2', { 'class': 'section-title', text: '审批范围' }), UI.field('审批模式', mode),
+        UI.field('当前工具：' + (state().tool === 'ssh' ? 'SSH 服务器' : '数据库'), scope.el), scopeHelp, refreshAliases,
+        UI.field('AI 决策有效期（秒）', ttl, { help: '范围 60–300 秒，决定仅使用一次。' }),
+        UI.el('p', { 'class': 'field-help', text: '模型异常、超时或无法确定时回退人工审批；AI 决定仅使用一次。另一个工具的审批范围会保留。' }),
+        UI.el('div', { 'class': 'settings-actions' }, [saveConfig, disable])
+      ]);
+      root.appendChild(error.el); root.appendChild(message);
+      root.appendChild(UI.el('div', { 'class': 'settings-grid' }, [connection, policy]));
+      root.appendChild(UI.el('section', { 'class': 'settings-section mt-16' }, [UI.el('h2', { 'class': 'section-title', text: '后台审批服务' }), serviceText, UI.el('div', { 'class': 'settings-actions' }, [start, stop, refreshStatus])]));
+      readAliases().then(function (hint) { if (current()) scopeHelp.textContent = hint; }).catch(function (err) { if (current()) scopeHelp.textContent = '加载连接别名失败：' + err.message + '。已保存选择保留，请刷新重试。'; });
+      requestStatus().catch(function () {});
+    }
+    function load() {
+      UI.clear(root); root.appendChild(UI.loadingBlock('正在加载 AI 设置…'));
+      return net.get('/api/ai/config').then(function (data) { if (current()) draw(data); }, function (err) {
+        if (current()) { UI.clear(root); root.appendChild(UI.errorBlock(err, load)); }
+      });
+    }
+    load();
   }
 
   BC.pages = {
@@ -1683,6 +2089,7 @@
     servers: serversPage,
     databases: databasesPage,
     approvals: approvalsPage,
-    audit: auditPage
+    audit: auditPage,
+    ai: aiPage
   };
 })();
