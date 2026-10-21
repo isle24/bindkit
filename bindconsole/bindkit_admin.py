@@ -46,8 +46,14 @@ class AdminAPI:
             result = action()
             if method == 'PUT' and result.get('mode') == 'off':
                 controller.service_stop()
-        except ValueError:
-            raise AdminError('AI_CONFIG_INVALID', 'AI 配置无效，或系统钥匙串不可用；请检查设置与集成运行时') from None
+        except ValueError as exc:
+            messages = {
+                'ai_base_url_requires_https': ('AI_ENDPOINT_HTTPS_REQUIRED', '公网或未识别的模型地址必须使用 HTTPS；本机回环和私有局域网 IP 可使用 HTTP'),
+                'ai_base_url_invalid': ('AI_ENDPOINT_INVALID', '模型 API 地址无效，请使用完整的 http:// 或 https:// 地址，且不要在地址中填写密钥'),
+                'model_credential_unavailable': ('AI_KEYCHAIN_UNAVAILABLE', '无法保存模型 API Key，请解锁系统钥匙串并检查集成运行时'),
+            }
+            code, message = messages.get(str(exc), ('AI_CONFIG_INVALID', 'AI 配置无效，请检查字段格式与集成运行时'))
+            raise AdminError(code, message) from None
         except Exception:
             raise AdminError('AI_UNAVAILABLE', 'AI 服务不可用，请检查集成运行时、系统钥匙串与模型配置', 503) from None
         if method != 'GET':

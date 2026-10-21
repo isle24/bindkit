@@ -118,6 +118,20 @@ class AITests(unittest.TestCase):
         self.assertEqual(self.c.list_models()['models'], ['synthetic'])
         self.assertTrue(self.c.test_connection()['connected'])
 
+    def test_private_lan_http_endpoint_can_save_keychain_model_connection(self):
+        for host in ('192.168.50.23', '10.2.3.4', '172.16.0.10', '[fd12::10]', '127.0.0.2', '[::1]'):
+            with self.subTest(host=host):
+                result = self.c.save_config({'base_url': 'http://' + host + ':18000/v1',
+                                             'model': 'synthetic', 'api_key': 'synthetic-secret'})
+                self.assertEqual(result['base_url'], 'http://' + host + ':18000/v1')
+                self.assertTrue(result['has_api_key'])
+                self.assertNotIn('synthetic-secret', json.dumps(result))
+
+    def test_public_and_ambiguous_http_addresses_still_require_https(self):
+        for host in ('8.8.8.8', '172.32.0.1', '192.169.0.1', '0.0.0.0', '169.254.169.254', 'example.invalid'):
+            with self.subTest(host=host), self.assertRaisesRegex(ValueError, 'ai_base_url_requires_https'):
+                self.c.save_config({'base_url': 'http://' + host + '/v1'})
+
     def test_queue_deduplicates_and_persists_only_redacted_bounded_jobs(self):
         self.enable(); self.ctx['command'] = 'password=synthetic-secret id'
         first = self.c.enqueue('ssh', 'apr_test', self.ctx)

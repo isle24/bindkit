@@ -146,6 +146,22 @@ class AdminAPITests(unittest.TestCase):
         self.assertEqual(self.client.get('/api/ai/service/status').status, 200)
         self.assertEqual(self.client.post('/api/ai/test').data['connected'], False)
 
+    def test_lan_ai_connection_can_be_saved_through_http_api(self):
+        self.login()
+        response = self.client.put('/api/ai/config', {'base_url': 'http://192.168.50.23:18000/v1',
+            'model': 'synthetic', 'api_key': 'synthetic-secret', 'mode': 'off'})
+        self.assertEqual(response.status, 200, response.text)
+        self.assertTrue(response.data['has_api_key'])
+        self.assertNotIn('synthetic-secret', response.text)
+
+    def test_endpoint_error_is_specific_and_does_not_blame_keychain(self):
+        self.login()
+        response = self.client.put('/api/ai/config', {'base_url': 'http://example.invalid/v1', 'api_key': 'synthetic-secret'})
+        self.assertEqual(response.status, 400)
+        self.assertEqual(response.error_code, 'AI_ENDPOINT_HTTPS_REQUIRED')
+        self.assertNotIn('钥匙串', response.error['message'])
+        self.assertNotIn('synthetic-secret', response.text)
+
     def test_audit_http_pages_filter_and_snapshot_rotation(self):
         self.login()
         path = self.home / '.bindconsole/audit.log'

@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import hashlib
 import importlib.util
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -25,6 +26,20 @@ from urllib.parse import urlsplit
 DEFAULT = {'mode': 'off', 'base_url': 'https://api.openai.com/v1', 'model': '',
            'scopes': {'ssh': [], 'db': []}, 'ttl_s': 120, 'key_ref': None}
 MAX_PAYLOAD = 16384
+_LAN_NETWORKS = tuple(ipaddress.ip_network(cidr) for cidr in
+                      ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', 'fc00::/7'))
+
+
+def _local_http_host(host):
+    if host.rstrip('.').lower() == 'localhost':
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return address.is_loopback or any(address in network for network in _LAN_NETWORKS)
 
 
 def _canonical(obj):
@@ -143,7 +158,7 @@ class ReviewController:
         url = urlsplit(config['base_url'])
         if url.scheme not in ('http', 'https') or not url.hostname or url.username or url.password or url.query or url.fragment:
             raise ValueError('ai_base_url_invalid')
-        if url.scheme == 'http' and url.hostname not in ('localhost', '127.0.0.1', '::1'):
+        if url.scheme == 'http' and not _local_http_host(url.hostname):
             raise ValueError('ai_base_url_requires_https')
         if not isinstance(config['model'], str) or len(config['model']) > 200: raise ValueError('ai_model_invalid')
         scopes = config['scopes']

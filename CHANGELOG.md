@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.1.1 — 2026-10-21
+
+- Fix saving local model connections over HTTP to private LAN IPs (RFC1918 and IPv6 ULA), while retaining HTTPS requirements for public/unknown hosts.
+- Distinguish invalid model URLs, HTTPS requirements and keychain write failures in the console instead of returning one misleading generic error.
+- Add isolated configuration/API regressions and validate a real local OpenAI-compatible provider through model discovery, connection testing and strict approval JSON output. Real credentials and endpoints are excluded from source and fixtures.
+
 ## v1.1.0 — 2026-10-21
 
 - Add managed `--as-user` SSH execution and prompt-aware sudo authentication through the local OS keychain.
