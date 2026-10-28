@@ -5,3 +5,5 @@
 # Keyring 25.7.0 declares Python >=3.9 and selects the OS keychain backend.
 keyring==25.7.0
 openai==2.48.0
+# Xshell session password migration uses the maintained ARC4 implementation.
+pycryptodome==3.23.0

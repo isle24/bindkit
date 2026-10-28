@@ -1063,6 +1063,14 @@ table.data-table { width: 100%; border-collapse: collapse; }
 .import-item-head .section-title { margin: 0; font-family: var(--mono); font-size: 13px; }
 .import-item .field-help { margin: 0; overflow-wrap: anywhere; }
 .import-outcome { font-size: 13px; overflow-wrap: anywhere; }
+.import-progress { margin: 16px 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.import-deferred { margin: 16px 0; padding: 16px; border: 1px solid var(--border); border-radius: var(--radius-sm); display: flex; flex-direction: column; gap: 12px; }
+.import-deferred .section-title, .import-deferred .field-help { margin: 0; }
+.import-deferred .check-item { overflow-wrap: anywhere; }
+.import-deferred-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.import-pending { color: var(--amber); }
+.import-item input[type="password"], .import-bulk input[type="password"] { min-width: 0; }
+.import-item-head .section-title { overflow-wrap: anywhere; }
 @media (max-width: 860px) {
   .settings-grid { grid-template-columns: minmax(0, 1fr); }
   .nav { overflow-x: auto; white-space: nowrap; }
@@ -1080,6 +1088,9 @@ table.data-table { width: 100%; border-collapse: collapse; }
   .choice-list .check-item, .import-item .input, .import-bulk .btn { min-height: 44px; }
   .import-item-head { flex-direction: column; }
   .import-bulk summary { padding: 8px 0; }
+  .import-deferred { padding: 12px; }
+  .import-deferred .check-item, .import-deferred .btn { min-height: 44px; }
+  .import-deferred-actions .btn { flex: 1 1 150px; }
 }
 @media (max-width: 760px) {
   .modal-overlay { overflow: hidden; }

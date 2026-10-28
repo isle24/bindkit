@@ -733,6 +733,8 @@ def _strip_block(text):
 
 
 def render_block(servers):
+    servers = {name: server for name, server in servers.items()
+               if server.get('key') and server.get('verification_status') != 'pending'}
     if not servers:
         return ""
     parts = [BLOCK_BEGIN]
@@ -1138,7 +1140,10 @@ def cmd_list(args):
                 "key_exists": key_ok,
                 "fingerprint": s.get("fingerprint"),
                 "installed": bool(s.get("installed", True)),
-                "usable": bool(key_ok and s.get("installed", True)),
+                "usable": bool(key_ok and s.get("installed", True) and s.get("verification_status") != "pending"),
+                "verification_status": s.get("verification_status", "verified" if s.get("installed", True) else "pending"),
+                "has_login_credential": bool(s.get("login_credential_ref")),
+                "has_encrypted_login": bool(s.get("encrypted_login_ref")),
             })
         print(json.dumps({"count": len(out), "servers": out},
                          ensure_ascii=False, indent=2))
@@ -1226,6 +1231,12 @@ def cmd_test(args):
             print("  %-16s %s" % (name, "未找到该绑定"))
             bad += 1
             continue
+        if s.get("verification_status") == "pending":
+            # CLI test is a read-only probe. Installing keys and activating an
+            # imported alias requires the user's explicit Web test action.
+            print("  %-16s 待验证，请本人在 Web 控制台点击测试连接完成启用" % name)
+            bad += 1
+            continue
         if not os.path.exists(s["key"]):
             print("  %-16s %s" % (name, "私钥文件缺失，无法测试"))
             bad += 1
@@ -1256,6 +1267,8 @@ def cmd_remove(args):
     adopted = s.get("source") == "adopted"
     do_revoke = not args.no_revoke
     delete_key = args.delete_key or (not adopted and not args.keep_key)
+    keyfile = s.get("key")
+    has_key_path = isinstance(keyfile, str) and bool(keyfile.strip()) and "\x00" not in keyfile
 
     print()
     print("  即将解绑  %s  (%s@%s:%s)" % (bold(args.name), s["user"], s["host"], s["port"]))
@@ -1279,7 +1292,7 @@ def cmd_remove(args):
             print("  已取消，未做任何改动")
             return 0
 
-    if do_revoke and os.path.exists(s["key"]):
+    if do_revoke and has_key_path and os.path.isfile(keyfile):
         info("正在从远端移除公钥 …")
         pubkey = read_pubkey_for(s["key"])
         if not pubkey:
@@ -1303,11 +1316,13 @@ def cmd_remove(args):
     elif do_revoke:
         warn("本地私钥不存在，跳过远端清理")
 
-    if delete_key:
-        for p in (s["key"], s["key"] + ".pub"):
-            if os.path.exists(p):
+    if delete_key and has_key_path:
+        for p in (keyfile, keyfile + ".pub"):
+            if os.path.isfile(p):
                 os.remove(p)
         info("本地密钥已删除")
+    elif delete_key:
+        info("此连接没有本地密钥，无需删除")
     else:
         info("本地密钥已保留：%s" % s["key"])
 
@@ -1645,7 +1660,7 @@ def _console_ssh_item(name, srv, mod):
         "source": srv.get("source", "generated"),
         "installed": installed,
         "key_exists": key_ok,
-        "usable": bool(key_ok and installed),
+        "usable": bool(key_ok and installed and srv.get("verification_status") != "pending"),
         "fingerprint": srv.get("fingerprint"),
         "created_at": srv.get("created_at"),
         "has_key": key_ok,
@@ -1657,6 +1672,9 @@ def _console_ssh_item(name, srv, mod):
         "allowed_users": eff.get("allowed_users", []) if eff else [],
         "sudo_auth": srv.get("sudo_auth", "none"),
         "has_sudo_credential": bool(srv.get("sudo_credential_ref")),
+        "verification_status": srv.get("verification_status", "verified" if installed else "pending"),
+        "has_login_credential": bool(srv.get("login_credential_ref")),
+        "has_encrypted_login": bool(srv.get("encrypted_login_ref")),
     }
 
 
@@ -1676,6 +1694,22 @@ def console_ssh_get(name):
 
 
 def console_ssh_create(body):
+    # The CLI create subprocess takes the shared mutation lock itself. Do not
+    # hold it while waiting for that subprocess; credential attachment takes a
+    # separate lock after its verified state commit.
+    return _console_ssh_create_transaction(body)
+
+
+def console_ssh_create_unverified(body):
+    pending = _extension_module("bindkit_pending", required=True)
+    connections = _extension_module("bindkit_connections", required=True)
+    try:
+        return pending.create_unverified(_self_module(), body)
+    except connections.ConnectionError as exc:
+        raise _console_fail(str(exc), exc.code) from None
+
+
+def _console_ssh_create_transaction(body):
     """创建失败且未登记服务器时，恢复本次写入前的策略。"""
     if not isinstance(body, dict):
         raise _console_fail("请求体必须是 JSON 对象")
@@ -1687,7 +1721,8 @@ def console_ssh_create(body):
     if before.get("corrupt"):
         raise _console_fail("SSH 策略损坏，请先修复策略", "INVALID_REQUEST")
     try:
-        return _console_ssh_create(body)
+        pending = _extension_module("bindkit_pending", required=True)
+        return pending.preserve_verified_password(_self_module(), body, lambda: _console_ssh_create(body))
     except Exception:
         # adopt 可能已保存记录、随后更新 SSH config 失败；这种情况保留密钥与策略。
         if name not in load_state()["servers"]:
@@ -1758,7 +1793,8 @@ def _console_ssh_create(body):
                         pass
         if rc != 0:
             raise _console_fail("导入私钥失败，请检查密钥与连接信息。", "CONNECTION_CREATE_FAILED")
-        return {"ok": True, "name": name, "auth": "private_key"}
+        row = load_state()["servers"].get(name) or {}
+        return {"ok": True, "name": name, "auth": "private_key", "id": row.get("id")}
 
     if isinstance(password, str) and password:
         # 密码导入：走 add --password-stdin（密码走 stdin，不进 argv）
@@ -1767,7 +1803,8 @@ def _console_ssh_create(body):
                                  stdin_data=password + "\n")
         if rc != 0:
             raise _console_fail("添加连接失败，请检查登录凭据与网络。", "CONNECTION_CREATE_FAILED")
-        return {"ok": True, "name": name, "auth": "password"}
+        row = load_state()["servers"].get(name) or {}
+        return {"ok": True, "name": name, "auth": "password", "id": row.get("id")}
 
     raise _console_fail("需要提供 auth.password 或 auth.private_key")
 
@@ -1882,6 +1919,13 @@ def console_ssh_test(name):
     srv = state["servers"].get(name)
     if not srv:
         raise _console_fail("没有这个服务器：%s" % name, "NOT_FOUND")
+    if srv.get("verification_status") == "pending":
+        pending = _extension_module("bindkit_pending", required=True)
+        connections = _extension_module("bindkit_connections", required=True)
+        try:
+            return pending.verify_pending(_self_module(), name)
+        except connections.ConnectionError as exc:
+            raise _console_fail(str(exc), exc.code) from None
     if not os.path.exists(srv.get("key") or ""):
         return {"ok": False, "usable": False, "message": "私钥文件缺失，无法测试"}
     alive, details = test_connection(srv["host"], srv["user"], srv["port"],
@@ -1889,6 +1933,18 @@ def console_ssh_test(name):
     return {"ok": bool(alive), "usable": bool(alive),
             "message": (details[0] if details else ("连通正常" if alive else "失败")),
             "details": details[:3]}
+
+
+def console_ssh_unlock(name, body):
+    name = _console_name(name)
+    if not isinstance(body, dict) or set(body) != {"credentials"}:
+        raise _console_fail("请求体必须包含 credentials 对象")
+    pending = _extension_module("bindkit_pending", required=True)
+    connections = _extension_module("bindkit_connections", required=True)
+    try:
+        return pending.unlock_credentials(_self_module(), name, body["credentials"])
+    except connections.ConnectionError as exc:
+        raise _console_fail(str(exc), exc.code) from None
 
 
 def console_ssh_policy_get():
@@ -1979,9 +2035,11 @@ def build_console_handlers():
         "list": console_ssh_list,
         "get": console_ssh_get,
         "create": console_ssh_create,
+        "create_unverified": console_ssh_create_unverified,
         "update": console_ssh_update,
         "delete": console_ssh_delete,
         "test": console_ssh_test,
+        "unlock": console_ssh_unlock,
         "users": console_ssh_users,
         "policy_get": console_ssh_policy_get,
         "policy_put": console_ssh_policy_put,
@@ -2092,6 +2150,8 @@ def cmd_exec(args):
     server = state["servers"].get(args.name)
     if not server:
         die("没有名为 %s 的绑定。先执行 sshbind list 看看有哪些" % args.name)
+    if not server.get("installed", True) or server.get("verification_status") == "pending":
+        die("连接尚未验证启用，请在 Web 控制台补充凭据并点击测试连接。")
     if not os.path.exists(server["key"]):
         die("私钥缺失，无法连接：%s" % server["key"])
     command = " ".join(args.command).strip()

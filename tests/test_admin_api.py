@@ -31,6 +31,7 @@ class AdminAPITests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name)
         self.created = []
+        self.deferred = []
         self.items = [{'name': 'existing', 'host': 'existing.example.com', 'user': 'ops', 'port': 22}]
         def create(body):
             self.created.append(dict(body))
@@ -40,6 +41,11 @@ class AdminAPITests(unittest.TestCase):
             return {'ok': True, 'name': body['name']}
         handlers = {'resource': 'servers', 'list': lambda: {'items': self.items},
                     'create': create, 'users': lambda name: {'users': [{'name': 'app', 'uid': 1001, 'sensitive': False}]}}
+        def deferred(body):
+            self.deferred.append(dict(body))
+            self.items.append({k: body[k] for k in ('name', 'host', 'user', 'port')})
+            return {'ok': True, 'pending': True, 'verified': False, 'usable': False}
+        handlers['create_unverified'] = deferred
         self.server = bc.create_server('ssh', port=0, home=str(self.home), handlers=handlers, policy=False)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -64,11 +70,13 @@ class AdminAPITests(unittest.TestCase):
 
     def test_new_routes_require_session_and_csrf(self):
         for method, url in [('GET', '/api/ai/config'), ('POST', '/api/ai/service/start'),
-                            ('POST', '/api/imports/preview'), ('GET', '/api/servers/existing/users')]:
+                            ('POST', '/api/imports/preview'), ('GET', '/api/servers/existing/users'),
+                            ('POST', '/api/servers/existing/unlock')]:
             self.assertEqual(self.client.request(method, url).status, 401)
         self.login()
         self.assertEqual(self.client.post('/api/imports/preview', {}, csrf=None).status, 403)
         self.assertEqual(self.client.put('/api/ai/config', {}, csrf=None).status, 403)
+        self.assertEqual(self.client.post('/api/servers/existing/unlock', {}, csrf=None).status, 403)
         self.assertEqual(self.client.get('/api/servers/existing/users').data['users'][0]['uid'], 1001)
 
     def test_import_is_preview_first_and_credentials_are_write_only(self):
@@ -117,6 +125,111 @@ class AdminAPITests(unittest.TestCase):
         response = self.client.post('/api/imports/preview', {'files': [{'name': 'x.xsh', 'content': '!!!'}]})
         self.assertEqual(response.status, 400)
         self.assertEqual(self.created, [])
+
+    def test_batch_preview_accepts_more_than_64_files_and_one_megabyte_after_auth(self):
+        self.login()
+        files = []
+        for n in range(70):
+            content = ('[CONNECTION]\nHost=synthetic.example\nPort=22\nProtocol=SSH\n'
+                       '[CONNECTION:AUTHENTICATION]\nUserName=ops\n;' + 'x' * 16000).encode()
+            files.append({'name': 'folder/server-%d.xsh' % n, 'content': base64.b64encode(content).decode()})
+        response = self.client.post('/api/imports/preview', {'files': files})
+        self.assertEqual(response.status, 200, response.text[:300])
+        self.assertEqual(response.data['count'], 70)
+        self.assertEqual(self.created, [])
+
+    def test_import_reuses_private_recovered_password_without_http_reflection(self):
+        self.login()
+        def parse(files, **kwargs):
+            kwargs['credential_sink']('session_synthetic', {'password': 'synthetic-recovered-secret'})
+            return {'count': 1, 'warnings': [], 'items': [{'id': 'session_synthetic', 'name': 'decoded',
+                'host': 'synthetic.example', 'port': 22, 'user': 'ops', 'has_imported_password': True}]}
+        with patch('bindkit_imports.parse_import_files', side_effect=parse):
+            response = self.preview()
+        self.assertEqual(response.status, 200, response.text)
+        self.assertNotIn('synthetic-recovered-secret', response.text)
+        preview = response.data
+        response = self.client.post('/api/imports/commit', {'preview_id': preview['preview_id'],
+            'items': [{'id': 'session_synthetic', 'name': 'decoded'}]})
+        self.assertEqual(response.data['imported'], 1)
+        self.assertEqual(self.created[0]['password'], 'synthetic-recovered-secret')
+        self.assertTrue(self.created[0]['preserve_password'])
+        self.assertNotIn('synthetic-recovered-secret', response.text)
+
+    def test_unreachable_import_requires_explicit_second_confirmation_and_retains_password(self):
+        self.login()
+        preview = self.preview(('failure',)).data
+        row = {'id': preview['items'][0]['id'], 'name': 'failure', 'login_password': 'synthetic-deferred-secret'}
+        response = self.client.post('/api/imports/commit', {'preview_id': preview['preview_id'], 'items': [row]})
+        self.assertEqual(response.data['failed'], 1)
+        self.assertTrue(response.data['results'][0]['can_add_unverified'])
+        self.assertEqual(self.deferred, [])
+        self.assertNotIn('synthetic-deferred-secret', response.text)
+        row.pop('login_password'); row['allow_unverified'] = True
+        response = self.client.post('/api/imports/commit', {'preview_id': preview['preview_id'], 'items': [row]})
+        self.assertEqual(response.data['imported'], 1)
+        self.assertTrue(response.data['results'][0]['pending'])
+        self.assertEqual(self.deferred[0]['password'], 'synthetic-deferred-secret')
+        self.assertNotIn('synthetic-deferred-secret', response.text)
+
+    def test_offline_flag_cannot_skip_initial_attempt_or_use_truthy_nonboolean(self):
+        self.login()
+        preview = self.preview().data
+        row = {'id': preview['items'][0]['id'], 'allow_unverified': True}
+        response = self.client.post('/api/imports/commit', {'preview_id': preview['preview_id'], 'items': [row]})
+        self.assertEqual(response.data['imported'], 0)
+        self.assertEqual(self.deferred, [])
+        row['allow_unverified'] = 'yes'
+        response = self.client.post('/api/imports/commit', {'preview_id': preview['preview_id'], 'items': [row]})
+        self.assertEqual(response.status, 400)
+
+    def test_metadata_only_or_encrypted_import_can_be_explicitly_saved_pending(self):
+        self.login()
+        preview = self.preview().data
+        row = {'id': preview['items'][0]['id']}
+        response = self.client.post('/api/imports/commit', {'preview_id': preview['preview_id'], 'items': [row]})
+        self.assertTrue(response.data['results'][0]['can_add_unverified'])
+        row['allow_unverified'] = True
+        response = self.client.post('/api/imports/commit', {'preview_id': preview['preview_id'], 'items': [row]})
+        self.assertTrue(response.data['results'][0]['pending'])
+        self.assertNotIn('password', self.deferred[0])
+
+    def test_pending_unlock_is_authenticated_write_only_callback(self):
+        self.login()
+        seen = []
+        def unlock(name, body):
+            seen.append((name, body['credentials']['master_password']))
+            return {'ok': True, 'has_login_credential': True, 'pending': True}
+        self.server.app.handlers['unlock'] = unlock
+        response = self.client.post('/api/servers/existing/unlock', {'credentials': {'master_password': 'synthetic-master-secret'}})
+        self.assertEqual(response.status, 200)
+        self.assertTrue(response.data['has_login_credential'])
+        self.assertEqual(seen, [('existing', 'synthetic-master-secret')])
+        self.assertNotIn('synthetic-master-secret', response.text)
+
+    def test_real_xshell_master_recovery_is_used_privately_by_commit(self):
+        try:
+            from Crypto.Cipher import ARC4
+        except ImportError:
+            self.skipTest('optional session crypto is not installed')
+        self.login()
+        # Published non-secret interoperability vector, independent of our encoder.
+        encoded = 'Rrm3P3AL0iDV7nBbS2bHvh7ZAvuN1NSJl8ZFL11+UJ+82+KAixa89O3OTAfRTg=='
+        content = ('[SESSIONINFO]\nVersion=6.0\n[CONNECTION]\nHost=synthetic.example\nPort=22\nProtocol=SSH\n'
+                   '[CONNECTION:AUTHENTICATION]\nUserName=ops\nPassword=' + encoded + '\n').encode()
+        body = {'files': [{'name': 'synthetic.xsh', 'content': base64.b64encode(content).decode()}],
+                'credentials': {'master_password': '123123'}}
+        response = self.client.post('/api/imports/preview', body)
+        self.assertEqual(response.status, 200, response.text)
+        self.assertTrue(response.data['items'][0]['has_imported_password'])
+        self.assertNotIn(encoded, response.text)
+        self.assertNotIn('This is a test', response.text)
+        preview = response.data
+        response = self.client.post('/api/imports/commit', {'preview_id': preview['preview_id'],
+            'items': [{'id': preview['items'][0]['id']}]})
+        self.assertEqual(response.data['imported'], 1)
+        self.assertEqual(self.created[0]['password'], 'This is a test')
+        self.assertNotIn('This is a test', response.text)
 
     def test_import_without_username_never_defaults_to_root(self):
         self.login()

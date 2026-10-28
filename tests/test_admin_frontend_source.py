@@ -7,10 +7,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
-@unittest.skipUnless(shutil.which('node'), 'Node is required for frontend checks')
-class AdminFrontendTests(unittest.TestCase):
-    def test_admin_workflows_with_synthetic_api(self):
-        script = r'''
+FRONTEND_HARNESS = r'''
 const assert = require('assert');
 const fs = require('fs');
 class N {
@@ -32,7 +29,7 @@ const UI={el:make,clear:n=>n.children=[],textInput:o=>make('input',o),textareaIn
  pageHeader:o=>({el:make('header',{},o.actions||[]),setCount:()=>{}}),
  dataTable:(cols,rows)=>{let el=make('table');rows.forEach(r=>cols.forEach(c=>el.append(c.render(r))));return{el};},
  openFormModal:o=>{modals.push(o);return{modal:{isClosed:()=>false},close:()=>{},setError:()=>{}};},
- openModal:o=>{modals.push(o);return{body:make('div'),footer:make('div'),close:()=>{},isClosed:()=>false};},
+ openModal:o=>{modals.push(o);let closed=false;return{body:make('div',{},o.body||[]),footer:make('div',{},o.footer||[]),close:()=>{closed=true;if(o.onClose)o.onClose();},isClosed:()=>closed};},
  formError:()=>({el:make('error'),hide:()=>{},show:()=>{}}),
  loadingBlock:()=>make('loading'),emptyBlock:o=>make('empty',o),errorBlock:e=>make('error',{text:e.message}),
  badge:t=>make('badge',{text:t}),chip:t=>make('chip',{text:t}),flag:()=>make('flag'),
@@ -44,9 +41,16 @@ global.document={createTextNode:t=>make('text',{text:t})};
 const BC=window.BC;
 eval(fs.readFileSync('bindconsole/web/pages.js','utf8'));
 const flush=async()=>{for(let i=0;i<15;i++)await Promise.resolve();};
-const find=id=>nodes.find(n=>n.attrs.testid===id||n.attrs['data-testid']===id);
+const find=id=>nodes.filter(n=>n.attrs.testid===id||n.attrs['data-testid']===id).at(-1);
 const click=async n=>{assert(n,'missing control');await n.events.click({preventDefault(){}});await flush();};
 const change=async(n,value)=>{n.value=value;await n.events.change({preventDefault(){}});await flush();};
+'''
+
+
+@unittest.skipUnless(shutil.which('node'), 'Node is required for frontend checks')
+class AdminFrontendTests(unittest.TestCase):
+    def test_admin_workflows_with_synthetic_api(self):
+        script = FRONTEND_HARNESS + r'''
 (async()=>{
   handler=(m,url,b)=>url==='/api/audit'?{entries:[{ts:'today',alias:'synthetic'}],total:101,page:b.page,page_size:b.page_size,pages:3,has_next:b.page<3,has_prev:b.page>1,snapshot:'stable-fixture'}:{};
   BC.pages.audit(make('view'),{epoch:1});await flush();
@@ -130,13 +134,13 @@ const change=async(n,value)=>{n.value=value;await n.events.change({preventDefaul
   global.FileReader=class{readAsDataURL(){this.result='data:text/plain;base64,c3ludGhldGlj';this.onload();}};
   handler=(m,url,b)=>{
     if(url==='/api/servers')return{servers:[server]};
-    if(url==='/api/imports/preview')return{preview_id:'fixture-preview',expires_at:'tomorrow',count:2,warnings:[],items:[0,1].map(i=>({id:'i'+i,name:'import-'+i,host:'fixture.invalid',user:i===1?'':'deploy',port:22,source:'xshell',auth_type:'password',requires_credentials:true,warnings:[]}))};
+    if(url==='/api/imports/preview')return{preview_id:'fixture-preview',expires_at:'tomorrow',count:2,warnings:[],items:[0,1].map(i=>({id:'i'+i,name:'import-'+i,host:'fixture.invalid',user:i===1?'':'deploy',port:22,source:'xshell',auth_type:'password',requires_credentials:true,has_imported_password:false,credential_status:'missing',warnings:[]}))};
     if(url==='/api/imports/commit')return{results:[{id:'i0',name:'import-0',ok:true},{id:'i1',name:'import-1',ok:false,error:'synthetic failed'}],imported:1,failed:1};
     return{};
   };
   BC.pages.servers(make('view'),{epoch:4});await flush();
   await click(find('btn-import'));
-  find('import-files').files=[{name:'too-large.zip',size:701*1024}];
+  find('import-files').files=[{name:'too-large.zip',size:16*1024*1024+1}];
   await click(find('import-preview'));
   assert(!requests.some(r=>r.url==='/api/imports/preview'));
   find('import-files').files=[{name:'fixture.xsh',size:42}];
@@ -157,6 +161,201 @@ const change=async(n,value)=>{n.value=value;await n.events.change({preventDefaul
   assert.strictEqual(find('import-password-1').value,'');
   assert.strictEqual(find('import-password-0').disabled,true);
 
+})().catch(e=>{process.stderr.write(e.stack);process.exitCode=1;});
+'''
+        result = subprocess.run(['node', '-e', script], cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_import_batch_unlock_and_explicit_pending_confirmation(self):
+        script = FRONTEND_HARNESS + r'''
+const item=i=>({id:'i'+i,name:'fixture-'+i,host:'fixture.invalid',port:22,user:'deploy',source:'xshell',auth_type:'password',has_imported_password:true,credential_status:'available',requires_credentials:false,warnings:[]});
+let previewItems=[item(0)], commitHandler=()=>({results:[]});
+let readCount=0;
+global.FileReader=class{readAsDataURL(){readCount++;this.result='data:text/plain;base64,c3ludGhldGlj';this.onload();}};
+const commits=()=>requests.filter(r=>r.url==='/api/imports/commit');
+const open=async()=>{
+  nodes=[];requests=[];modals=[];
+  handler=(m,url,b)=>{
+    if(url==='/api/servers')return{servers:[{name:'fixture-pending',verification_status:'pending',usable:false,installed:false,source:'imported',host:'fixture.invalid',user:'deploy',port:22}]};
+    if(url==='/api/imports/preview')return{preview_id:'synthetic-preview',items:previewItems,expires_at:1793200000,warnings:[]};
+    if(url==='/api/imports/commit')return commitHandler(b);
+    return{};
+  };
+  BC.pages.servers(make('view'),{epoch:5});await flush();
+  assert(find('verification-fixture-pending').textContent.includes('待验证'));
+  await click(find('btn-import'));
+};
+(async()=>{
+  await open();
+  assert.strictEqual(find('import-directory').attrs.webkitdirectory,true);
+  assert.strictEqual(find('import-files').attrs.multiple,true);
+  assert(find('import-files').attrs.accept.includes('.xts'));
+  assert.strictEqual(find('import-master-password').attrs.type,'password');
+  assert.strictEqual(find('import-master-password').value,'');
+  find('import-files').files=[{name:'too-big.xts',size:16*1024*1024+1}];
+  await click(find('import-preview'));
+  assert.strictEqual(readCount,0);
+  find('import-files').files=Array.from({length:1025},(_,i)=>({name:i+'.xsh',size:1}));
+  await click(find('import-preview'));assert.strictEqual(readCount,0);
+  find('import-files').files=[{name:'sessions.xts',size:1024*1024}];
+  find('import-directory').files=[{name:'session.xsh',webkitRelativePath:'sessions/session.xsh',size:12}];
+  find('import-master-password').value='synthetic-unlock';
+  find('import-source-username').value='fixture-user';find('import-source-sid').value='S-1-5-21-123';
+  await click(find('import-preview'));
+  let uploaded=requests.find(r=>r.url==='/api/imports/preview').body;
+  assert.strictEqual(uploaded.files.length,2);
+  assert.strictEqual(uploaded.files[1].name,'sessions/session.xsh');
+  assert.deepStrictEqual(uploaded.credentials,{master_password:'synthetic-unlock',source_username:'fixture-user',source_sid:'S-1-5-21-123'});
+  assert.strictEqual(find('import-master-password').value,'');
+  assert.strictEqual(find('import-files').files.length,1);
+  assert.strictEqual(find('import-password-0').value,'');
+  assert(find('import-credential-0').textContent.includes('已恢复'));
+  commitHandler=b=>({results:b.items.map(x=>({id:x.id,name:x.name,ok:false,can_add_unverified:true,error:'synthetic unreachable'}))});
+  await click(find('import-commit'));
+  assert.strictEqual(commits().length,1);
+  assert(!('allow_unverified' in commits()[0].body.items[0]));
+  assert(!('login_password' in commits()[0].body.items[0]));
+  assert(!find('import-deferred').hidden);
+  assert.strictEqual(find('import-deferred-select-0').checked,false);
+  await click(find('import-deferred-cancel'));
+  assert.strictEqual(commits().length,1);
+  assert(find('import-deferred').hidden);
+  assert.strictEqual(find('import-select-0').checked,true);
+  await click(find('import-commit'));
+  assert.strictEqual(commits().length,2);
+  await click(find('import-deferred-confirm'));
+  assert.strictEqual(commits().length,2);
+  find('import-deferred-select-0').checked=true;
+  await change(find('import-deferred-select-0'),true);
+  commitHandler=b=>({results:b.items.map(x=>({id:x.id,name:x.name,ok:true,pending:true,verified:false})),pending:1});
+  await click(find('import-deferred-confirm'));
+  assert.strictEqual(commits().length,3);
+  assert.strictEqual(commits()[2].body.items[0].allow_unverified,true);
+  assert(find('import-result-0').textContent.includes('待验证'));
+  assert(!find('import-result-0').textContent.includes('已连接'));
+  assert.strictEqual(find('import-select-0').checked,false);
+
+  previewItems=Array.from({length:23},(_,i)=>({...item(i),has_imported_password:i!==1,credential_status:i===1?'needs_context':'available',requires_credentials:i===1}));
+  await open();
+  find('import-files').files=[{name:'sessions.zip',size:100}];await click(find('import-preview'));
+  assert(find('import-credential-1').textContent.includes('原始文件'));
+  find('import-password-0').value='synthetic-manual';
+  let inFlight=0, maxInFlight=0, progress=[];
+  commitHandler=async b=>{
+    inFlight++;maxInFlight=Math.max(maxInFlight,inFlight);progress.push(find('import-status').textContent);
+    await Promise.resolve();inFlight--;
+    return{results:b.items.map(x=>({id:x.id,name:x.name,ok:x.id!=='i1'&&x.id!=='i2',verified:x.id!=='i1'&&x.id!=='i2',can_add_unverified:x.id==='i1',error:'synthetic failed'}))};
+  };
+  await click(find('import-commit'));
+  assert.deepStrictEqual(commits().map(r=>r.body.items.length),[10,10,3]);
+  assert.strictEqual(maxInFlight,1);
+  assert(progress[0].includes('0 / 23')&&progress[1].includes('10 / 23')&&progress[2].includes('20 / 23'));
+  assert.strictEqual(find('import-password-0').value,'');
+  assert.strictEqual(find('import-select-1').checked,true);
+  assert(find('import-deferred-select-1'));
+  assert(!find('import-deferred-select-2'));
+  find('import-deferred-select-1').checked=true;
+  commitHandler=b=>({results:b.items.map(x=>({id:x.id,name:x.name,ok:true,pending:true}))});
+  await click(find('import-deferred-confirm'));
+  assert.deepStrictEqual(commits().at(-1).body.items,[{id:'i1',name:'fixture-1',user:'deploy',allow_unverified:true}]);
+  assert.strictEqual(find('import-select-2').checked,true);
+
+  previewItems=[{...item(0),has_imported_password:false,credential_status:'invalid',requires_credentials:true}];
+  await open();find('import-files').files=[{name:'session.xsh',size:3}];await click(find('import-preview'));
+  find('import-password-0').value='synthetic-discard';find('import-key-0').value='';
+  commitHandler=()=>{throw{message:'synthetic HTTP failure'};};
+  await click(find('import-commit'));
+  assert.strictEqual(commits().length,1);
+  assert.strictEqual(find('import-password-0').value,'');
+  assert(find('import-deferred').hidden);
+  assert.strictEqual(find('import-select-0').checked,true);
+  commitHandler=b=>({results:b.items.map(x=>({id:x.id,name:x.name,ok:true,verified:true}))});
+  await click(find('import-commit'));assert.strictEqual(commits().length,2);
+  assert(!('login_password' in commits()[1].body.items[0]));
+  assert(find('import-result-0').textContent.includes('已导入'));
+
+  // A later HTTP failure stops following chunks, clears unsent secrets, and
+  // never turns an uncertain request into an offline-add permission.
+  previewItems=Array.from({length:23},(_,i)=>item(i));
+  await open();find('import-files').files=[{name:'sessions.zip',size:3}];await click(find('import-preview'));
+  find('import-key-11').value='synthetic-key';find('import-password-22').value='synthetic-unsent';
+  let batch=0;
+  commitHandler=b=>{batch++;if(batch===2)throw{message:'synthetic interrupted'};return{results:b.items.map(x=>({id:x.id,name:x.name,ok:true,verified:true}))};};
+  await click(find('import-commit'));
+  assert.deepStrictEqual(commits().map(r=>r.body.items.length),[10,10]);
+  assert.strictEqual(find('import-key-11').value,'');assert.strictEqual(find('import-password-22').value,'');
+  assert.strictEqual(find('import-select-0').checked,false);assert.strictEqual(find('import-select-11').checked,true);
+  assert(find('import-result-11').textContent.includes('请求未完成'));
+  assert(find('import-deferred').hidden);
+
+  // Request failures and preview limits never retain the unlock password or
+  // private keys in form fields, and never commit any connection.
+  await open();
+  find('import-files').files=[{name:'sessions.xts',size:3}];find('import-master-password').value='synthetic-unlock';
+  const baseHandler=handler;
+  handler=(m,url,b)=>{if(url==='/api/imports/preview')throw{message:'synthetic preview failure'};return baseHandler(m,url,b);};
+  await click(find('import-preview'));
+  assert.strictEqual(find('import-master-password').value,'');assert.strictEqual(commits().length,0);
+  assert.strictEqual(find('import-files').files.length,1);
+  handler=baseHandler;previewItems=Array.from({length:1025},(_,i)=>item(i));
+  await click(find('import-preview'));assert(find('import-commit').disabled);
+  assert(!find('import-password-0'));
+  previewItems=[item(0)];await click(find('import-preview'));
+  find('import-password-0').value='synthetic-close';find('import-key-0').value='synthetic-close-key';
+  find('import-master-password').value='synthetic-close-unlock';find('import-bulk-password').value='synthetic-close-bulk';
+  await click(find('import-close'));
+  assert.strictEqual(find('import-password-0').value,'');assert.strictEqual(find('import-key-0').value,'');
+  assert.strictEqual(find('import-master-password').value,'');assert.strictEqual(find('import-bulk-password').value,'');
+})().catch(e=>{process.stderr.write(e.stack);process.exitCode=1;});
+'''
+        result = subprocess.run(['node', '-e', script], cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_saved_xshell_cipher_unlock_never_tests_or_exposes_credentials(self):
+        script = FRONTEND_HARNESS + r'''
+(async()=>{
+  let fail=true, notices=[];
+  UI.successToast=message=>notices.push(message);
+  handler=(m,url,b)=>{
+    if(url==='/api/servers')return{servers:[{name:'locked',user:'deploy',host:'fixture.invalid',port:22,verification_status:'pending',has_encrypted_login:true},{name:'plain',host:'fixture.invalid',user:'deploy',port:22}]};
+    if(url==='/api/servers/locked/unlock'){if(fail==='result')return{ok:false,code:'CREDENTIAL_UNLOCK_FAILED',message:'synthetic incorrect master'};if(fail)throw{message:'synthetic incorrect context'};return{ok:true,unlocked:true};}
+    return{};
+  };
+  BC.pages.servers(make('view'),{epoch:6});await flush();
+  assert(find('unlock-locked'));assert(!find('unlock-plain'));
+  await click(find('unlock-locked'));
+  let form=modals.at(-1);
+  assert.strictEqual(find('unlock-master-password').attrs.type,'password');
+  assert.strictEqual(find('unlock-master-password').value,'');
+  assert(form.validate());
+  find('unlock-master-password').value='synthetic-wrong';
+  find('unlock-source-username').value='fixture-user';find('unlock-source-sid').value='S-1-5-21-123';
+  assert.strictEqual(form.validate(),null);
+  await form.onSubmit({close(){}}).catch(()=>{});
+  const failed=requests.find(r=>r.url.endsWith('/unlock'));
+  assert.deepStrictEqual(failed.body,{credentials:{master_password:'synthetic-wrong',source_username:'fixture-user',source_sid:'S-1-5-21-123'}});
+  assert.strictEqual(find('unlock-master-password').value,'');
+  assert(!requests.some(r=>r.url.endsWith('/test')));
+  assert.strictEqual(notices.length,0);
+  let closed=0, rejected=null;
+  const listReads=requests.filter(r=>r.url==='/api/servers').length;
+  find('unlock-master-password').value='synthetic-wrong-result';fail='result';
+  await form.onSubmit({close(){closed++;}}).catch(error=>{rejected=error;});await flush();
+  assert(rejected,'ok:false must keep the form open and display a safe failure');
+  assert(rejected.message.includes('解锁失败'));
+  assert(!rejected.message.includes('synthetic-wrong-result'));
+  assert.strictEqual(find('unlock-master-password').value,'');
+  assert.strictEqual(closed,0);assert.strictEqual(notices.length,0);
+  assert.strictEqual(requests.filter(r=>r.url==='/api/servers').length,listReads);
+  find('unlock-master-password').value='synthetic-correct';fail=false;
+  await form.onSubmit({close(){closed++;}});await flush();
+  assert.strictEqual(closed,1);
+  assert.strictEqual(find('unlock-master-password').value,'');
+  assert(notices.some(x=>x.includes('已解锁，可点击测试连接')));
+  assert(!requests.some(r=>r.url.endsWith('/test')));
+  assert(!requests.some(r=>r.method==='put'));
+  find('unlock-master-password').value='synthetic-close';form.onClose();
+  assert.strictEqual(find('unlock-master-password').value,'');
 })().catch(e=>{process.stderr.write(e.stack);process.exitCode=1;});
 '''
         result = subprocess.run(['node', '-e', script], cwd=ROOT, capture_output=True, text=True)

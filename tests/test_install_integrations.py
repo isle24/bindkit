@@ -50,7 +50,7 @@ class IntegrationInstallTests(unittest.TestCase):
             self.assertEqual(call.returncode, 0, call.stderr)
         receipt = json.loads((self.home / '.local/share/bindkit/install-receipt.json').read_text())
         paths = {entry['path'] for entry in receipt['files']}
-        for name in ('bindkit_vault.py', 'bindkit_privilege.py', 'bindkit_connections.py', 'bindkit_ai.py', 'bindkit_catalog.py', 'bindkit_imports.py', 'bindkit_admin.py', 'bindkit_orchestration.py'):
+        for name in ('bindkit_vault.py', 'bindkit_privilege.py', 'bindkit_connections.py', 'bindkit_ai.py', 'bindkit_catalog.py', 'bindkit_imports.py', 'bindkit_admin.py', 'bindkit_orchestration.py', 'bindkit_pending.py', 'bindkit_xshell_crypto.py'):
             self.assertIn(str(self.home / '.bindconsole/lib' / name), paths)
         self.assertNotIn(str(self.built[0] / 'bin/python'), paths)
     def test_plain_upgrade_preserves_enabled_runtime_without_builder(self):
@@ -60,6 +60,17 @@ class IntegrationInstallTests(unittest.TestCase):
         self.assertTrue(result['integrations'])
         self.assertEqual((self.home / '.local/bin/sshbind').read_bytes(), original)
         self.assertEqual(list(self.home.rglob('*.bindkit-backup-*')), [])
+
+    def test_enabled_runtime_refreshes_when_optional_dependency_manifest_changes(self):
+        first = self.install(True)
+        receipt = self.home / '.local/share/bindkit/install-receipt.json'
+        data = json.loads(receipt.read_text())
+        data['integrations']['requirements_sha256'] = 'synthetic-old-dependency-manifest'
+        receipt.write_text(json.dumps(data))
+        second = self.install(False)
+        self.assertEqual(len(self.built), 2)
+        self.assertNotEqual(first['runtime'], second['runtime'])
+        self.assertTrue(Path(first['runtime']).exists())
     def test_failed_runtime_build_leaves_old_code_receipt_and_state_untouched(self):
         self.install()
         receipt = self.home / '.local/share/bindkit/install-receipt.json'

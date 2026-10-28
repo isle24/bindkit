@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.2.0 — 2026-10-28
+
+- Expand session import to multiple files, folders and ordinary ZIP/.xts exports: up to 1024 sessions and 16 MiB, sequential ten-row progress and per-row results.
+- Reuse supported Xshell saved passwords with an explicitly supplied master password or original Windows identity, using PyCryptodome and digest verification where available. Public previews never return plaintext or ciphertext passwords.
+- Retain imported login credentials and unrecovered encrypted descriptors in the OS keychain; add a write-only unlock action for later recovery.
+- Offer explicit deferred registration after a failed attempt. Pending connections stay unusable until a later connection test succeeds; offline registration and cipher unlock do not access remote servers.
+- Refresh an already enabled optional runtime when its dependency manifest changes; retain old code/runtime for recovery.
+- Add isolated parser, cipher, HTTP, lifecycle and UI regressions. Real user session files and credentials are excluded from tests and release files.
+
 ## v1.1.1 — 2026-10-21
 
 - Fix saving local model connections over HTTP to private LAN IPs (RFC1918 and IPv6 ULA), while retaining HTTPS requirements for public/unknown hosts.

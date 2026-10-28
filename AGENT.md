@@ -36,8 +36,15 @@ enable AI review, expand scope or alter protected security configuration to bypa
 
 SSH credential edits preserve aliases and policy. A login password is used to install/verify a replacement
 public key, not to change the remote account password. Old keys remain until an explicit revocation.
-Session import requires a preview and explicit selection. Xshell .xsh/ordinary ZIP, FinalShell JSON and
-OpenSSH config import connection metadata; vendor-encrypted passwords are not recovered. Never execute
+Session import requires a preview and explicit selection. Xshell .xsh/.xts ZIP, FinalShell JSON and
+OpenSSH config support batches up to 1024 sessions/16 MiB. Xshell passwords can be recovered with
+explicitly provided master password or original Windows identity; never ask for those in chat.
+Decoded passwords and retained encrypted descriptors use the local OS keychain, never plaintext files.
+After a failed import, only the human's explicit confirmation may add an unverified connection.
+Pending aliases remain installed:false/usable:false until test verifies and activates them; agents
+must not use or silently activate pending aliases. Cipher unlock alone never connects to a server.
+CLI `sshbind test` stays read-only; activation is a separate human action through the Web console.
+Never execute
 imported ProxyCommand/LocalCommand, read referenced key paths, or overwrite an existing alias implicitly.
 
 Audit responses include server-side page counts and a snapshot token. Keep that token across pages;

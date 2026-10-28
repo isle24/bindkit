@@ -4,12 +4,14 @@ import json
 import os
 import struct
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'bindconsole'))
 SPEC = importlib.util.spec_from_file_location('imports_under_test', ROOT / 'bindconsole/bindkit_imports.py')
 IMPORTS = None
 if Path(SPEC.origin).exists():
@@ -46,7 +48,7 @@ class ImportTests(unittest.TestCase):
         result = self.parse(xsh(extra='Password=synthetic-secret\nPasswordV2=encrypted-secret\n'))
         self.assertEqual(result['count'], 1)
         item = result['items'][0]
-        self.assertEqual(set(item), {'id', 'name', 'host', 'port', 'user', 'source', 'auth_type', 'requires_credentials', 'key_hint', 'warnings'})
+        self.assertEqual(set(item), {'id', 'name', 'host', 'port', 'user', 'source', 'auth_type', 'requires_credentials', 'key_hint', 'warnings', 'credential_status', 'has_imported_password'})
         self.assertEqual((item['name'], item['host'], item['port'], item['user']), ('demo', 'synthetic.example', 2202, 'demo'))
         self.assertTrue(item['requires_credentials'])
         self.assertEqual(item['source'], 'xshell')
@@ -207,6 +209,137 @@ Host third
                                    ('openssh', 'unknown', b'Host demo\n HostName synthetic.example\n')):
             with self.subTest(fmt=fmt), patch('builtins.open', side_effect=AssertionError('preview is memory-only')):
                 self.assertEqual(self.parse(content, name, format=fmt)['count'], 1)
+
+    def test_more_than_64_files_and_1024_zip_members_are_supported(self):
+        files = [{'name': 'directory/%d.xsh' % n, 'content': xsh()} for n in range(1024)]
+        result = IMPORTS.parse_import_files(files)
+        self.assertEqual(result['count'], 1024)
+        result = self.parse(archive([('nested/%d.xsh' % n, xsh()) for n in range(1024)]), 'batch.xts')
+        self.assertEqual(result['count'], 1024)
+
+    def test_request_file_limit_is_16mib_and_member_limit_stays_4mib(self):
+        self.assertEqual(IMPORTS.MAX_FILE_BYTES, 16 * 1024 * 1024)
+        self.assertEqual(IMPORTS.MAX_FILES, 1024)
+        self.assertEqual(IMPORTS.MAX_ARCHIVE_ENTRIES, 1024)
+        # Avoid compression-ratio rejection obscuring the member-size check.
+        with patch.object(IMPORTS, 'MAX_COMPRESSION_RATIO', 100000):
+            result = self.parse(archive([('large.xsh', b'A' * (4 * 1024 * 1024 + 1))]), 'large.zip')
+        self.assertEqual(result['count'], 0)
+        self.assertIn('member', ' '.join(result['warnings']).lower())
+
+    def test_saved_password_needs_context_and_private_descriptor_uses_final_id(self):
+        value = 'Rrm3P3AL0iDV7nBbS2bHvh7ZAvuN1NSJl8ZFL11+UJ+82+KAixa89O3OTAfRTg=='
+        content = xsh(extra='Password=' + value + '\n') + b'[SessionInfo]\nVersion=6.0\n'
+        captured = {}
+        result = self.parse(content, reserved_names=['demo'], credential_sink=captured.__setitem__)
+        item = result['items'][0]
+        self.assertEqual(item['name'], 'demo-2')
+        self.assertEqual(item['credential_status'], 'needs_context')
+        self.assertFalse(item['has_imported_password'])
+        self.assertTrue(item['requires_credentials'])
+        self.assertEqual(captured, {item['id']: {'encrypted_password': value, 'version': '6.0'}})
+        self.assertNotIn(value, json.dumps(result))
+
+    def test_empty_saved_password_missing_and_finalshell_cipher_unsupported(self):
+        captured = {}
+        for content in (xsh(), xsh(extra='Password=\nPasswordSaved=1\n')):
+            result = self.parse(content, credential_sink=captured.__setitem__)
+            self.assertEqual(result['items'][0]['credential_status'], 'missing')
+            self.assertFalse(result['items'][0]['has_imported_password'])
+        self.assertEqual(captured, {})
+        result = self.parse(b'{"host":"synthetic.example","password":"vendor-encrypted"}', 'final.json', credential_sink=captured.__setitem__)
+        self.assertEqual(result['items'][0]['credential_status'], 'unsupported')
+        self.assertEqual(captured, {})
+
+    def test_missing_backend_warns_how_to_enable_recovery_and_retains_cipher(self):
+        captured = {}
+        value = '/6KaTrKwm0cmhr0yAWQ='
+        content = xsh(extra='Password=' + value + '\n') + b'[SessionInfo]\nVersion=5.0\n'
+        with patch.dict(sys.modules, {'Crypto': None, 'Crypto.Cipher': None, 'Crypto.Cipher.ARC4': None}):
+            result = self.parse(content, credential_sink=captured.__setitem__)
+        item = result['items'][0]
+        self.assertEqual(item['credential_status'], 'unsupported')
+        self.assertIn('pycryptodome', ' '.join(item['warnings']).lower())
+        self.assertEqual(captured[item['id']]['encrypted_password'], value)
+
+    def test_master_unlocks_zip_batch_without_reflecting_secrets(self):
+        try:
+            from Crypto.Cipher import ARC4  # noqa: F401
+        except ImportError:
+            self.skipTest('optional pycryptodome required for cipher vectors')
+        value = 'Rrm3P3AL0iDV7nBbS2bHvh7ZAvuN1NSJl8ZFL11+UJ+82+KAixa89O3OTAfRTg=='
+        content = xsh(extra='Password=' + value + '\n') + b'[SessionInfo]\nVersion=6.0\n'
+        captured = {}
+        result = self.parse(archive([('nested/one.xsh', content), ('two.xsh', content)]), 'batch.xts',
+                            credentials={'master_password': '123123'}, credential_sink=captured.__setitem__)
+        self.assertEqual(result['count'], 2)
+        for item in result['items']:
+            self.assertEqual(item['credential_status'], 'available')
+            self.assertTrue(item['has_imported_password'])
+            self.assertFalse(item['requires_credentials'])
+            self.assertEqual(captured[item['id']], {'password': 'This is a test'})
+        public = json.dumps(result)
+        for secret in (value, '123123', 'This is a test', 'encrypted_password'):
+            self.assertNotIn(secret, public)
+
+    def test_password_value_does_not_influence_candidate_id(self):
+        try:
+            from Crypto.Cipher import ARC4  # noqa: F401
+        except ImportError:
+            self.skipTest('optional pycryptodome required for cipher vectors')
+        value = 'Rrm3P3AL0iDV7nBbS2bHvh7ZAvuN1NSJl8ZFL11+UJ+82+KAixa89O3OTAfRTg=='
+        content = xsh(extra='Password=' + value + '\n') + b'[SessionInfo]\nVersion=6.0\n'
+        locked = self.parse(content)
+        unlocked = self.parse(content, credentials={'master_password': '123123'})
+        self.assertEqual(locked['items'][0]['id'], unlocked['items'][0]['id'])
+
+    def test_invalid_or_unknown_saved_password_has_explicit_safe_status(self):
+        cases = [('6.0', 'not-base64!', 'invalid'), ('9.0', '/6KaTrKwm0cmhr0yAWQ=', 'unsupported'),
+                 ('version-secret', '/6KaTrKwm0cmhr0yAWQ=', 'unsupported')]
+        for version, value, expected in cases:
+            with self.subTest(version=version):
+                content = xsh(extra='Password=' + value + '\n') + ('[SessionInfo]\nVersion=' + version + '\n').encode()
+                result = self.parse(content, credentials={'master_password': 'private-master'})
+                self.assertEqual(result['items'][0]['credential_status'], expected)
+                for secret in (value, version if 'secret' in version else 'unrelated', 'private-master'):
+                    self.assertNotIn(secret, json.dumps(result))
+
+    def test_unknown_version_and_passwordv2_preserve_bounded_cipher_with_unknown_marker(self):
+        value = '/6KaTrKwm0cmhr0yAWQ='
+        for field, extra in [('Password', ''), ('PasswordV2', '[SessionInfo]\nVersion=7.1\n')]:
+            with self.subTest(field=field):
+                captured = {}
+                result = self.parse(xsh(extra=field + '=' + value + '\n') + extra.encode(),
+                                    credential_sink=captured.__setitem__)
+                item = result['items'][0]
+                self.assertEqual(item['credential_status'], 'unsupported')
+                self.assertEqual(captured[item['id']], {'encrypted_password': value, 'version': 'unknown'})
+
+    def test_wrong_batch_unlock_retains_cipher_and_source_identity_unlocks_utf16(self):
+        try:
+            from Crypto.Cipher import ARC4  # noqa: F401
+        except ImportError:
+            self.skipTest('optional pycryptodome required for cipher vectors')
+        value = 'zv21O1x43qRs3c5NckDHvh7ZAvuN1NSJl8ZFL11+UJ+82+KAixa89O3OTAfRTg=='
+        content = (xsh(extra='Password=' + value + '\n').decode() + '[SessionInfo]\nVersion=5.3\n').encode('utf-16')
+        captured = {}
+        result = self.parse(content, credentials={'master_password': 'wrong-private-master'}, credential_sink=captured.__setitem__)
+        item = result['items'][0]
+        self.assertEqual(item['credential_status'], 'invalid')
+        self.assertEqual(captured[item['id']], {'encrypted_password': value, 'version': '5.3'})
+        result = self.parse(content, credentials={'source_username': 'Administrator',
+                            'source_sid': 'S-1-5-21-917267712-1342860078-1792151419-512'}, credential_sink=captured.__setitem__)
+        self.assertEqual(result['items'][0]['credential_status'], 'available')
+        self.assertEqual(captured[item['id']], {'password': 'This is a test'})
+
+    def test_oversized_cipher_is_not_retained_and_sink_must_be_callable(self):
+        captured = {}
+        result = self.parse(xsh(extra='Password=' + 'A' * 10000 + '\n') + b'[SessionInfo]\nVersion=6.0\n',
+                            credential_sink=captured.__setitem__)
+        self.assertEqual(result['items'][0]['credential_status'], 'invalid')
+        self.assertEqual(captured, {})
+        with self.assertRaises(ValueError):
+            self.parse(xsh(), credential_sink='unsafe')
 
 
 if __name__ == '__main__':

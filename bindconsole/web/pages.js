@@ -400,8 +400,10 @@
       installed: (raw.installed === true) ? true : (raw.installed === false ? false : null),
       usable: (raw.usable === true) ? true : (raw.usable === false ? false : null),
       usableReason: raw.usable_reason || raw.reason || '',
+      verificationStatus: raw.verification_status || '',
       hasKey: raw.has_key === true || !!raw.key_path,
       hasPassword: raw.has_password === true,
+      hasEncryptedLogin: raw.has_encrypted_login === true,
       sudoAuth: raw.sudo_auth || 'none',
       hasSudoCredential: raw.has_sudo_credential === true,
       keychain: raw.keychain || {},
@@ -501,7 +503,15 @@
         },
         {
           label: '来源',
-          render: function (row) { return sourceCell(row.server.source); }
+          render: function (row) {
+            var box = UI.el('span', { 'class': 'badge-stack' }, [sourceCell(row.server.source)]);
+            if (row.server.verificationStatus === 'pending') {
+              var pending = UI.badge('待验证', 'amber', { title: '尚未验证连接，暂不可用于执行命令' });
+              pending.setAttribute('data-testid', 'verification-' + row.server.name);
+              box.appendChild(pending);
+            }
+            return box;
+          }
         },
         {
           label: '已安装',
@@ -543,7 +553,14 @@
             });
             var delBtn = UI.btnLink('删除', { danger: true, testid: 'delete-' + s.name });
             delBtn.addEventListener('click', function () { deleteServer(s); });
-            return UI.el('span', {}, [testBtn, editBtn, delBtn]);
+            var actions = UI.el('span', {}, [testBtn, editBtn]);
+            if (s.hasEncryptedLogin) {
+              var unlockBtn = UI.btnLink('解锁 Xshell 密码', { testid: 'unlock-' + s.name });
+              unlockBtn.addEventListener('click', function () { openUnlockServer(s); });
+              actions.appendChild(unlockBtn);
+            }
+            actions.appendChild(delBtn);
+            return actions;
           }
         }
       ], rows);
@@ -560,6 +577,7 @@
       net.post(resourcePath(server.name, 'test'), {}).then(function (data) {
         var ok = !(data && data.ok === false);
         var message = (data && (data.message || data.usable_reason)) || (ok ? '连接正常' : '连接失败');
+        if (ok && server.verificationStatus === 'pending') load(false);
         row.lastTestCell.textContent = ok ? '✓ 正常' : '✗ 失败';
         row.lastTestCell.className = ok ? 'flag flag-yes' : 'flag flag-no';
         UI.toast((ok ? '测试通过：' : '测试失败：') + server.name, {
@@ -781,6 +799,46 @@
       });
       app().registerCleanup(function () { formApi.close(); });
       discoverUsers();
+    }
+
+    function openUnlockServer(server) {
+      var masterPassword = UI.textInput({ type: 'password', autocomplete: 'new-password', placeholder: '可选：Xshell 主密码', testid: 'unlock-master-password' });
+      var sourceUsername = UI.textInput({ autocomplete: 'off', placeholder: '可选：源 Windows 用户名', testid: 'unlock-source-username' });
+      var sourceSid = UI.textInput({ autocomplete: 'off', placeholder: '可选：源 Windows SID', testid: 'unlock-source-sid' });
+      function clearSecret() { masterPassword.value = ''; }
+      var formApi = UI.openFormModal({
+        title: '解锁 Xshell 密码 · ' + server.name,
+        subtitle: '使用已保存在系统钥匙串中的加密凭据恢复登录密码。解锁后可自行测试连接。',
+        narrow: true, submitLabel: '解锁密码', busyLabel: '正在解锁…',
+        body: [
+          UI.field('Xshell 主密码', masterPassword, { help: '这是 Xshell 安全设置中的总密码，不是服务器登录密码；未设置过可留空。仅用于本次解锁，提交后清空。' }),
+          UI.field('源 Windows 用户名', sourceUsername), UI.field('源 Windows SID', sourceSid),
+          UI.el('p', { 'class': 'field-help', text: '没有主密码：在原 Windows 的 PowerShell 分别执行 $env:USERNAME 和 whoami /user，把第一条输出的用户名（保留大小写）和第二条的 SID 填入。解锁本身不连接服务器，成功后可点击「测试」。' })
+        ],
+        validate: function () {
+          if (!masterPassword.value && !sourceUsername.value.trim() && !sourceSid.value.trim()) {
+            clearSecret(); return { message: '请提供 Xshell 主密码或源 Windows 用户名 / SID' };
+          }
+          return null;
+        },
+        onClose: function () { clearSecret(); sourceUsername.value = ''; sourceSid.value = ''; },
+        onSubmit: function (api) {
+          var credentials = {};
+          if (masterPassword.value) credentials.master_password = masterPassword.value;
+          if (sourceUsername.value.trim()) credentials.source_username = sourceUsername.value.trim();
+          if (sourceSid.value.trim()) credentials.source_sid = sourceSid.value.trim();
+          clearSecret();
+          return net.post(resourcePath(server.name, 'unlock'), { credentials: credentials }).then(function (data) {
+            if (!data || data.ok !== true) throw { message: 'Xshell 密码解锁失败，请核对主密码或源 Windows 用户名 / SID 后重试。' };
+            api.close(); UI.successToast('已解锁，可点击测试连接'); return load(false);
+          }).then(function () {
+            clearSecret(); Object.keys(credentials).forEach(function (key) { delete credentials[key]; });
+          }, function (err) {
+            clearSecret(); Object.keys(credentials).forEach(function (key) { delete credentials[key]; }); throw err;
+          });
+        }
+      });
+      app().registerCleanup(function () { formApi.close(); });
     }
 
     function deleteServer(server) {
@@ -1756,40 +1814,77 @@
   }
 
   function openImportConnections(onImported) {
+    var MAX_FILES = 1024, MAX_BYTES = 16 * 1024 * 1024, COMMIT_SIZE = 10;
     var files = UI.el('input', { type: 'file', multiple: true, accept: '.xsh,.zip,.xts,.json,.config,.conf,config', 'class': 'input', 'data-testid': 'import-files' });
+    var directory = UI.el('input', { type: 'file', multiple: true, webkitdirectory: true, 'class': 'input', 'data-testid': 'import-directory' });
     var format = UI.selectInput({ value: 'auto', testid: 'import-format', options: [
       { value: 'auto', label: '自动识别' }, { value: 'xshell', label: 'Xshell' }, { value: 'finalshell', label: 'FinalShell' }, { value: 'openssh', label: 'OpenSSH config' }
     ] });
+    var masterPassword = UI.textInput({ type: 'password', autocomplete: 'new-password', testid: 'import-master-password', placeholder: '可选：本批 Xshell 的主密码' });
+    var sourceUsername = UI.textInput({ autocomplete: 'off', testid: 'import-source-username', placeholder: '可选：导出电脑上的 Windows 用户名' });
+    var sourceSid = UI.textInput({ autocomplete: 'off', testid: 'import-source-sid', placeholder: '可选：导出电脑上的 Windows SID' });
+    var unlock = UI.el('details', { 'class': 'import-bulk' }, [
+      UI.el('summary', { text: '恢复 Xshell 保存的密码（可选）' }),
+      UI.el('div', { 'class': 'form mt-16' }, [
+      UI.field('Xshell 主密码', masterPassword, { help: '这是 Xshell 安全设置中的总密码，不是各台服务器的登录密码；没有设置过可留空。同一批只填一次，提交后清空。' }),
+        UI.field('源 Windows 用户名', sourceUsername), UI.field('源 Windows SID', sourceSid),
+      UI.el('p', { 'class': 'field-help', text: '没有主密码：在原 Windows 的 PowerShell 分别执行 $env:USERNAME 和 whoami /user，将第一条输出的用户名（保留大小写）及第二条的 SID 填入。无法恢复时会保留密文，可先添加待验证，稍后解锁。' })
+      ])
+    ]);
     var error = UI.formError();
-    var source = UI.el('div', { 'class': 'form' }, [UI.field('格式', format), UI.field('连接文件（可多选）', files, { help: '支持 .xsh、普通 ZIP、FinalShell JSON 与 OpenSSH config，总大小不超过 700 KiB。受保护的 .xts 容器可能需要重新导出为单独 .xsh 或普通 ZIP。' })]);
+    var source = UI.el('div', { 'class': 'form' }, [
+      UI.field('格式', format),
+      UI.field('连接文件（可多选）', files, { help: '支持 .xsh、ZIP / .xts、FinalShell JSON 与 OpenSSH config；文件和目录合计最多 1024 个文件、16 MiB，最多预览 1024 条连接。' }),
+      UI.field('或选择连接目录', directory, { help: '可选择 Xshell 会话目录及其子目录；与上方文件一同预览。' }), unlock
+    ]);
     var previewArea = UI.el('div');
-    var status = UI.el('p', { 'class': 'field-help', 'aria-live': 'polite', 'data-testid': 'import-status' });
-    var rows = [], preview = null, busy = false;
+    var status = UI.el('p', { 'class': 'field-help import-progress', 'aria-live': 'polite', 'data-testid': 'import-status' });
+    var deferred = UI.el('section', { 'class': 'import-deferred', hidden: true, 'data-testid': 'import-deferred' });
+    var rows = [], preview = null, busy = false, selectAll, bulkPassword, bulkKey, bulkApply;
     var previewBtn = UI.button({ label: '预览连接', testid: 'import-preview', onClick: previewFiles });
-    var commitBtn = UI.button({ label: '导入所选连接', variant: 'primary', testid: 'import-commit', disabled: true, onClick: commit });
-    var closeBtn = UI.button({ label: '关闭', variant: 'ghost', onClick: function () { modal.close(); } });
+    var commitBtn = UI.button({ label: '验证并导入所选', variant: 'primary', testid: 'import-commit', disabled: true, onClick: function () { return commit(false); } });
+    var closeBtn = UI.button({ label: '关闭', variant: 'ghost', testid: 'import-close', onClick: function () { modal.close(); } });
+    var deferredConfirm = UI.button({ label: '先添加待验证连接', testid: 'import-deferred-confirm', disabled: true, onClick: function () { return commit(true); } });
+    var deferredCancel = UI.button({ label: '暂不添加', variant: 'ghost', testid: 'import-deferred-cancel', onClick: function () {
+      if (busy) return;
+      hideDeferred(); status.textContent = '已取消添加待验证连接。失败条目仍保留，可补充信息后重试。';
+    } });
     var modal = UI.openModal({
-      title: '导入连接', subtitle: '只迁移连接信息。加密密码不会恢复，登录凭据需自行补充；不会覆盖已有连接。',
-      body: [error.el, source, status, previewArea], footer: [closeBtn, previewBtn, commitBtn],
-      onClose: function () { clearSecrets(); files.value = ''; preview = null; rows = []; }
+      title: '导入连接', subtitle: '恢复可用的登录凭据并验证连接；暂时无法验证时，可自行选择先添加为待验证。已有别名不会被覆盖。',
+      body: [error.el, source, status, deferred, previewArea], footer: [closeBtn, previewBtn, commitBtn],
+      onClose: function () { clearSecrets(); files.value = ''; directory.value = ''; sourceUsername.value = ''; sourceSid.value = ''; preview = null; rows = []; }
     });
     app().registerCleanup(function () { modal.close(); });
-    function clearSecrets() {
-      rows.forEach(function (row) { row.password.value = ''; row.key.value = ''; });
+    function clearSecrets(targets) {
+      (targets || rows).forEach(function (row) { row.password.value = ''; row.key.value = ''; });
+      masterPassword.value = '';
       if (bulkPassword) bulkPassword.value = '';
       if (bulkKey) bulkKey.value = '';
     }
+    function updateDeferredButton() {
+      deferredConfirm.disabled = busy || !rows.some(function (row) { return !row.done && row.deferredChoice && row.deferredChoice.checked; });
+    }
+    function hideDeferred() {
+      deferred.hidden = true;
+      rows.forEach(function (row) { if (row.deferredChoice) row.deferredChoice.checked = false; });
+      updateDeferredButton();
+    }
     function setBusy(flag) {
-      busy = flag; previewBtn.disabled = flag; closeBtn.disabled = flag;
-      files.disabled = flag; format.disabled = flag;
+      busy = flag; previewBtn.disabled = flag; closeBtn.disabled = flag; deferredCancel.disabled = flag;
+      [files, directory, format, masterPassword, sourceUsername, sourceSid].forEach(function (field) { field.disabled = flag; });
       commitBtn.disabled = flag || !preview || !rows.some(function (row) { return !row.done; });
+      if (selectAll) selectAll.disabled = flag;
       if (bulkApply) bulkApply.disabled = flag;
-      rows.forEach(function (row) { [row.selected, row.name, row.user, row.password, row.key].forEach(function (field) { field.disabled = flag || row.done; }); });
+      [bulkPassword, bulkKey].forEach(function (field) { if (field) field.disabled = flag; });
+      rows.forEach(function (row) {
+        [row.selected, row.name, row.user, row.password, row.key, row.deferredChoice].forEach(function (field) { if (field) field.disabled = flag || row.done; });
+      });
+      updateDeferredButton();
     }
     function readFile(file) {
       return new Promise(function (resolve, reject) {
         var reader = new FileReader();
-        reader.onload = function () { resolve({ name: file.name, content: String(reader.result).split(',')[1] || '' }); };
+        reader.onload = function () { resolve({ name: file.webkitRelativePath || file.name, content: String(reader.result).split(',')[1] || '' }); };
         reader.onerror = function () { reject({ message: '无法读取文件：' + file.name }); };
         reader.readAsDataURL(file);
       });
@@ -1797,31 +1892,51 @@
     function previewFiles() {
       if (busy) return;
       error.hide();
-      var selectedFiles = Array.prototype.slice.call(files.files || []);
-      if (!selectedFiles.length) { showFormError(error, { message: '请先选择连接文件' }); return; }
-      if (selectedFiles.reduce(function (sum, file) { return sum + file.size; }, 0) > 700 * 1024) {
-        showFormError(error, { message: '文件总大小超过 700 KiB，请减少文件或分批导入' }); return;
+      var selectedFiles = Array.prototype.slice.call(files.files || []).concat(Array.prototype.slice.call(directory.files || []));
+      if (!selectedFiles.length) { showFormError(error, { message: '请先选择连接文件或目录' }); return; }
+      if (selectedFiles.length > MAX_FILES) { showFormError(error, { message: '一次最多选择 1024 个文件，请减少文件或分批导入' }); return; }
+      if (selectedFiles.reduce(function (sum, file) { return sum + file.size; }, 0) > MAX_BYTES) {
+        showFormError(error, { message: '文件总大小超过 16 MiB，请减少文件或分批导入' }); return;
       }
-      clearSecrets(); preview = null; rows = []; UI.clear(previewArea); setBusy(true); status.textContent = '正在读取并预览连接…';
-      Promise.all(selectedFiles.map(readFile)).then(function (payload) {
+      var credentials = {};
+      if (masterPassword.value) credentials.master_password = masterPassword.value;
+      if (sourceUsername.value.trim()) credentials.source_username = sourceUsername.value.trim();
+      if (sourceSid.value.trim()) credentials.source_sid = sourceSid.value.trim();
+      clearSecrets(); hideDeferred(); preview = null; rows = []; UI.clear(previewArea); setBusy(true); status.textContent = '正在读取并预览连接…';
+      return Promise.all(selectedFiles.map(readFile)).then(function (payload) {
         if (modal.isClosed()) return null;
-        return net.post('/api/imports/preview', { format: format.value, files: payload });
+        var request = { format: format.value, files: payload };
+        if (Object.keys(credentials).length) request.credentials = credentials;
+        return net.post('/api/imports/preview', request);
       }).then(function (data) {
         if (!data || modal.isClosed()) return;
-        preview = data; files.value = ''; renderPreview(data);
+        if (listOf(data, 'items').length > MAX_FILES) throw { message: '预览连接超过 1024 条，请减少文件或分批导入' };
+        preview = data; renderPreview(data);
       }).catch(function (err) {
-        if (!modal.isClosed()) { clearSecrets(); showFormError(error, err); status.textContent = '预览失败，文件未导入。可以更换格式或文件后重试。'; }
-      }).then(function () { if (!modal.isClosed()) setBusy(false); });
+        if (!modal.isClosed()) { clearSecrets(); showFormError(error, err); status.textContent = '预览失败，文件未导入。保留原始文件选择，可补充解锁信息或更换格式后重试。'; }
+      }).then(function () {
+        Object.keys(credentials).forEach(function (key) { delete credentials[key]; });
+        if (!modal.isClosed()) setBusy(false);
+      });
     }
-    var bulkPassword, bulkKey, bulkApply;
+    function credentialText(item) {
+      if (item.has_imported_password === true) return '已恢复登录密码 · 服务端暂存，留空即可复用，不回显。';
+      var labels = {
+        needs_context: '需要 Xshell 主密码或源 Windows 用户名 / SID。请保留原始文件，补充信息后重新预览。',
+        invalid: '密码恢复校验失败。请核对解锁信息并保留原始文件，可重新预览或手动补充。',
+        unsupported: '此版本的保存密码暂不支持恢复。请保留原始文件，可手动补充登录凭据。',
+        missing: '文件中没有可恢复的登录密码，可补充登录密码或私钥。'
+      };
+      return labels[item.credential_status] || '可补充登录密码或私钥；暂缺凭据时，可在验证失败后确认添加待验证连接。';
+    }
     function renderPreview(data) {
       UI.clear(previewArea); rows = [];
       var items = listOf(data, 'items');
       var expiresAt = typeof data.expires_at === 'number' ? new Date(data.expires_at < 1e12 ? data.expires_at * 1000 : data.expires_at).toISOString() : data.expires_at;
-      status.textContent = '发现 ' + items.length + ' 条连接。预览有效期至 ' + UI.fmtDateTime(expiresAt) + '；勾选条目后补充登录凭据。';
+      status.textContent = '发现 ' + items.length + ' 条连接。预览凭据仅在服务端暂存 10 分钟，有效期至 ' + UI.fmtDateTime(expiresAt) + '。已恢复的密码无需重填。';
       (data.warnings || []).forEach(function (warning) { previewArea.appendChild(UI.el('div', { 'class': 'warn-banner', text: warning })); });
-      if (!items.length) { previewArea.appendChild(emptyPage('没有可导入的连接', '请检查格式，或导出为单独 .xsh、普通 ZIP、FinalShell JSON 或 OpenSSH config。')); return; }
-      bulkPassword = UI.textInput({ type: 'password', autocomplete: 'new-password', testid: 'import-bulk-password', placeholder: '用于所选条目的 SSH 登录密码' });
+      if (!items.length) { previewArea.appendChild(emptyPage('没有可导入的连接', '请检查格式，或导出为单独 .xsh、ZIP / .xts、FinalShell JSON 或 OpenSSH config。')); return; }
+      bulkPassword = UI.textInput({ type: 'password', autocomplete: 'new-password', testid: 'import-bulk-password', placeholder: '可选：替换所选条目的 SSH 登录密码' });
       bulkKey = UI.textareaInput({ rows: 3, testid: 'import-bulk-key', placeholder: '或粘贴用于所选条目的私钥内容' });
       bulkApply = UI.button({ label: '应用到所选条目', small: true, testid: 'import-bulk-apply', onClick: function () {
         if (busy) return;
@@ -1833,70 +1948,118 @@
         bulkPassword.value = ''; bulkKey.value = ''; error.hide();
         status.textContent = '已为 ' + targets.length + ' 条所选连接补充凭据，请检查后导入。';
       } });
-      var bulk = UI.el('details', { 'class': 'import-bulk' }, [UI.el('summary', { text: '批量补充同一份登录凭据' }), UI.el('div', { 'class': 'form mt-16' }, [UI.field('SSH 登录密码', bulkPassword), UI.field('私钥内容', bulkKey), bulkApply])]);
-      previewArea.appendChild(bulk);
-      var selectAll = UI.checkboxInput('选择全部未导入连接', { checked: true, testid: 'import-select-all' });
-      selectAll.input.addEventListener('change', function () { if (!busy) rows.forEach(function (row) { if (!row.done) row.selected.checked = selectAll.input.checked; }); });
-      previewArea.appendChild(selectAll.wrap);
+      previewArea.appendChild(UI.el('details', { 'class': 'import-bulk' }, [UI.el('summary', { text: '批量补充同一份登录凭据（可选）' }), UI.el('div', { 'class': 'form mt-16' }, [UI.field('SSH 登录密码', bulkPassword), UI.field('私钥内容', bulkKey), bulkApply])]));
+      var all = UI.checkboxInput('选择全部未导入连接', { checked: true, testid: 'import-select-all' });
+      selectAll = all.input;
+      selectAll.addEventListener('change', function () { if (!busy) rows.forEach(function (row) { if (!row.done) row.selected.checked = selectAll.checked; }); });
+      previewArea.appendChild(all.wrap);
       items.forEach(function (item, index) {
         var selected = UI.checkboxInput('导入此连接', { checked: true, testid: 'import-select-' + index });
         var name = UI.textInput({ value: item.name, testid: 'import-name-' + index });
         var user = UI.textInput({ value: item.user || '', placeholder: '请明确填写 SSH 登录用户', testid: 'import-user-' + index });
-        var password = UI.textInput({ type: 'password', autocomplete: 'new-password', placeholder: '填写登录密码，或使用下方私钥', testid: 'import-password-' + index });
-        var key = UI.textareaInput({ rows: 3, placeholder: '粘贴私钥内容；不会读取导出文件中的密钥路径', testid: 'import-key-' + index });
+        var password = UI.textInput({ type: 'password', autocomplete: 'new-password', placeholder: item.has_imported_password ? '留空使用已恢复密码；填写可替换' : '可选：填写登录密码，或使用下方私钥', testid: 'import-password-' + index });
+        var key = UI.textareaInput({ rows: 3, placeholder: '可选：粘贴私钥内容；不会读取导出文件中的密钥路径', testid: 'import-key-' + index });
+        var credential = UI.el('p', { 'class': 'field-help', text: credentialText(item), 'data-testid': 'import-credential-' + index });
         var outcome = UI.el('div', { 'class': 'import-outcome', 'aria-live': 'polite', 'data-testid': 'import-result-' + index });
-        var row = { id: item.id, name: name, user: user, selected: selected.input, password: password, key: key, outcome: outcome, done: false };
+        var row = { id: item.id, index: index, name: name, user: user, selected: selected.input, password: password, key: key, credential: credential, outcome: outcome, done: false, canAddUnverified: false };
         rows.push(row);
         var section = UI.el('section', { 'class': 'import-item' }, [
           UI.el('div', { 'class': 'import-item-head' }, [UI.el('h3', { 'class': 'section-title', text: (item.user || '未指定用户') + '@' + item.host + ':' + item.port }), selected.wrap]),
-          UI.el('p', { 'class': 'field-help', text: '来源 ' + item.source + ' · 认证 ' + item.auth_type + (item.key_hint ? ' · 密钥提示 ' + item.key_hint : '') + (item.requires_credentials ? ' · 需要补充登录凭据' : '') }),
-          UI.field('导入别名', name), UI.field('SSH 登录用户', user, { required: true, help: '请核对目标身份；导出文件未提供用户时必须补充，不会默认使用 root。' }), UI.field('SSH 登录密码', password), UI.field('私钥内容', key), outcome
+          UI.el('p', { 'class': 'field-help', text: '来源 ' + item.source + ' · 认证 ' + item.auth_type + (item.key_hint ? ' · 密钥提示 ' + item.key_hint : '') }), credential,
+          UI.field('导入别名', name), UI.field('SSH 登录用户', user, { required: true, help: '请核对目标身份；导出文件未提供用户时必须补充，不会默认使用 root。' }), UI.field('SSH 登录密码（可选）', password), UI.field('私钥内容（可选）', key), outcome
         ]);
         (item.warnings || []).forEach(function (warning) { section.appendChild(UI.el('p', { 'class': 'field-help', text: warning })); });
         previewArea.appendChild(section);
       });
     }
-    function commit() {
+    function showDeferred() {
+      UI.clear(deferred);
+      var eligible = rows.filter(function (row) { return !row.done && row.canAddUnverified; });
+      if (!eligible.length) { hideDeferred(); return; }
+      deferred.appendChild(UI.el('h3', { 'class': 'section-title', text: '选择要先添加的待验证连接' }));
+      deferred.appendChild(UI.el('p', { 'class': 'field-help', text: '以下连接未能完成验证。勾选后只保存连接信息与可用凭据，不连接服务器、不标记为可用。之后可在服务器列表中「测试」；缺少凭据时可先「编辑」补充。' }));
+      eligible.forEach(function (row) {
+        var choice = UI.checkboxInput(row.name.value.trim() + ' · ' + row.user.value.trim() + ' · 待验证', { checked: false, testid: 'import-deferred-select-' + row.index });
+        row.deferredChoice = choice.input;
+        choice.input.addEventListener('change', updateDeferredButton);
+        deferred.appendChild(choice.wrap);
+      });
+      deferred.appendChild(UI.el('div', { 'class': 'import-deferred-actions' }, [deferredCancel, deferredConfirm]));
+      deferred.hidden = false;
+      updateDeferredButton();
+    }
+    function rowItem(row, allowUnverified) {
+      var item = { id: row.id, name: row.name.value.trim(), user: row.user.value.trim() };
+      if (row.key.value.trim()) item.private_key = row.key.value.trim();
+      else if (row.password.value) item.login_password = row.password.value;
+      if (allowUnverified) item.allow_unverified = true;
+      return item;
+    }
+    function commit(allowUnverified) {
       if (busy || !preview) return;
       error.hide();
-      var selected = rows.filter(function (row) { return row.selected.checked && !row.done; });
-      if (!selected.length) { showFormError(error, { message: '请至少选择一条尚未导入的连接' }); return; }
+      var selected = rows.filter(function (row) {
+        return !row.done && (allowUnverified ? row.canAddUnverified && row.deferredChoice && row.deferredChoice.checked : row.selected.checked);
+      });
+      if (!selected.length) { showFormError(error, { message: allowUnverified ? '请勾选要添加的待验证连接' : '请至少选择一条尚未导入的连接' }); return; }
       var names = Object.create(null), validation = '';
-      var items = selected.map(function (row) {
-        var name = row.name.value.trim();
-        var user = row.user.value.trim();
+      selected.forEach(function (row) {
+        var name = row.name.value.trim(), user = row.user.value.trim();
         if (!/^[A-Za-z_][A-Za-z0-9_.@\\-]{0,127}$/.test(user)) validation = '请为连接 ' + name + ' 填写合法的 SSH 登录用户';
         if (!/^[A-Za-z0-9_.-]+$/.test(name) || name.indexOf('..') >= 0) validation = '别名只能包含字母、数字、点、下划线、连字符，且不能含 ..';
         if (names[name]) validation = '所选条目的别名重复：' + name;
         names[name] = true;
         if (row.password.value && row.key.value.trim()) validation = '连接 ' + name + ' 的登录密码和私钥只需填写一种';
-        if (!row.password.value && !row.key.value.trim()) validation = '请为连接 ' + name + ' 补充 SSH 登录密码或私钥';
-        var item = { id: row.id, name: name, user: user, sudo: 'ask' };
-        if (row.key.value.trim()) item.private_key = row.key.value.trim(); else item.login_password = row.password.value;
-        return item;
       });
-      if (validation) { items.forEach(function (item) { delete item.login_password; delete item.private_key; }); showFormError(error, { message: validation }); return; }
-      setBusy(true); status.textContent = '正在验证凭据并导入，请勿重复提交…';
-      net.post('/api/imports/commit', { preview_id: preview.preview_id, items: items }).then(function (data) {
-        if (modal.isClosed()) { if (data.imported && onImported) return onImported(); return; }
-        var results = listOf(data, 'results');
-        selected.forEach(function (row) {
-          var result = results.filter(function (entry) { return entry.id === row.id; })[0];
-          if (result && result.ok === true) {
-            row.done = true; row.selected.checked = false;
-            row.outcome.textContent = '已导入：' + result.name; row.outcome.className = 'import-outcome flag-yes';
-          } else {
-            row.outcome.textContent = '导入失败：' + (result && result.error || '未收到该条目的结果，请检查连接列表后重试');
+      if (validation) { showFormError(error, { message: validation }); return; }
+      if (!allowUnverified) selected.forEach(function (row) { row.canAddUnverified = false; });
+      hideDeferred(); setBusy(true);
+      var processed = 0, verified = 0, pending = 0, failed = 0;
+      function nextChunk() {
+        if (modal.isClosed() || processed >= selected.length) return Promise.resolve();
+        var chunk = selected.slice(processed, processed + COMMIT_SIZE);
+        var items = chunk.map(function (row) { return rowItem(row, allowUnverified); });
+        status.textContent = (allowUnverified ? '正在添加待验证连接 ' : '正在验证并导入 ') + processed + ' / ' + selected.length + '（每批最多 10 条）…';
+        return net.post('/api/imports/commit', { preview_id: preview.preview_id, items: items }).then(function (data) {
+          var results = listOf(data, 'results');
+          chunk.forEach(function (row, index) {
+            var result = results.filter(function (entry) { return entry.id === row.id; })[0];
+            if (!allowUnverified) row.canAddUnverified = !!(result && result.ok !== true && result.can_add_unverified === true);
+            if (result && result.ok === true) {
+              row.done = true; row.selected.checked = false; row.canAddUnverified = false;
+              if (result.pending === true || result.verified === false) {
+                pending++; row.outcome.textContent = '已添加待验证：' + (result.name || row.name.value) + '。尚未连接成功，请稍后测试。'; row.outcome.className = 'import-outcome import-pending';
+              } else {
+                verified++; row.outcome.textContent = '已导入并验证：' + (result.name || row.name.value); row.outcome.className = 'import-outcome flag-yes';
+              }
+            } else {
+              failed++;
+              row.outcome.textContent = '导入失败：' + (result && result.error || '未收到该条目的结果，请检查连接列表后重试');
+              row.outcome.className = 'import-outcome flag-no';
+            }
+            if (items[index].login_password || items[index].private_key) row.credential.textContent = '凭据已提交服务端暂存；已保留不回显，预览有效期内可直接重试。';
+          });
+          processed += chunk.length;
+        }).then(function () {
+          clearSecrets(chunk); items.forEach(function (item) { delete item.login_password; delete item.private_key; });
+          return nextChunk();
+        }, function (err) {
+          chunk.forEach(function (row) {
+            row.outcome.textContent = '请求未完成：' + (err.message || '请检查连接列表后重试');
             row.outcome.className = 'import-outcome flag-no';
-          }
+          });
+          clearSecrets(chunk); items.forEach(function (item) { delete item.login_password; delete item.private_key; });
+          throw err;
         });
-        status.textContent = '导入成功 ' + data.imported + ' 条，失败 ' + data.failed + ' 条。失败条目的别名和选择已保留，重新补充凭据后可重试。';
-        if (data.imported && onImported) return onImported();
+      }
+      return nextChunk().then(function () {
+        if (!modal.isClosed()) status.textContent = '已处理 ' + processed + ' / ' + selected.length + '：验证成功 ' + verified + ' 条，待验证 ' + pending + ' 条，失败 ' + failed + ' 条。失败条目的别名和选择已保留，可直接重试或补充凭据。';
       }).catch(function (err) {
-        if (!modal.isClosed()) { showFormError(error, err); status.textContent = '导入请求失败。连接信息已保留，请检查列表与错误信息，再补充凭据重试。'; }
+        if (!modal.isClosed()) { showFormError(error, err); status.textContent = '导入请求中断，已处理 ' + processed + ' / ' + selected.length + '。未完成条目仍保留，请检查列表后重试。'; }
       }).then(function () {
-        clearSecrets(); items.forEach(function (item) { delete item.login_password; delete item.private_key; });
-        if (!modal.isClosed()) setBusy(false);
+        clearSecrets();
+        if (!modal.isClosed()) { setBusy(false); showDeferred(); }
+        if ((verified || pending) && onImported) return onImported();
       });
     }
   }

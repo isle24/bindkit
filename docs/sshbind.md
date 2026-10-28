@@ -45,5 +45,6 @@ sshbind exec --json --as-user root demo-server 'id'
 `--stdin` 显式启用命令输入；选项仍在别名前。执行状态未知时禁止自动重试。
 
 服务器页「导入连接」先预览 Xshell `.xsh`/普通 ZIP、FinalShell SSH JSON 或 OpenSSH config，选择条目后补充凭据。
-不恢复受保护 `.xts` 容器或加密密码，不读取引用密钥文件、不执行代理/本地命令、不覆盖现有别名。
+可多选文件/选择目录/导入 ZIP 格式 `.xts`。提供一次 Xshell 主密码或源 Windows 身份后批量恢复支持版本的密码，不读取引用密钥文件、不执行代理/本地命令、不覆盖现有别名。
+验证失败可明确确认先添加，状态为待验证；密码或原密文保存在系统钥匙串。后续可解锁密码并点击测试连接，成功后才变为 usable:true。
 更多步骤见 [管理说明](administration.md)。

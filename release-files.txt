@@ -18,6 +18,8 @@ bindconsole/bindkit_connections.py
 bindconsole/bindkit_imports.py
 bindconsole/bindkit_orchestration.py
 bindconsole/bindkit_privilege.py
+bindconsole/bindkit_pending.py
+bindconsole/bindkit_xshell_crypto.py
 bindconsole/bindkit_vault.py
 bindconsole/web/index.html
 bindconsole/web/style.css
@@ -36,6 +38,8 @@ docs/sshbind.md
 docs/dbbind.md
 docs/security-model.md
 docs/administration.md
+docs/superpowers/specs/2026-10-28-import-reliability.md
+docs/superpowers/plans/2026-10-28-import-reliability.md
 docs/superpowers/plans/2026-10-20-approval-credentials-imports.md
 docs/superpowers/specs/2026-10-20-approval-credentials-imports.md
 docs/releasing.md
@@ -62,4 +66,6 @@ tests/test_connections.py
 tests/test_imports.py
 tests/test_install_integrations.py
 tests/test_privilege.py
+tests/test_pending_connections.py
+tests/test_xshell_crypto.py
 tests/test_vault.py

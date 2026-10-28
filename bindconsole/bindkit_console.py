@@ -106,7 +106,7 @@ except ImportError:                     # pragma: no cover - Windows
 # 常量
 # ---------------------------------------------------------------------------
 
-KERNEL_VERSION = "1.1.1"
+KERNEL_VERSION = "1.2.0"
 VERSION = KERNEL_VERSION                      # 兼容别名
 
 ALLOWED_TOOLS = ("ssh", "db")
@@ -134,6 +134,7 @@ PBKDF2_MIN_ITERATIONS = 200_000
 MIN_PASSWORD_LEN = 8
 MAX_PASSWORD_LEN = 1024
 MAX_BODY_BYTES = 1 << 20                      # 1 MiB
+MAX_IMPORT_BODY_BYTES = 24 << 20              # Authenticated preview only; 16 MiB base64 input
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCKOUT_S = 60
 AUDIT_TARGET_TRUNCATE = 500
@@ -1588,6 +1589,7 @@ class ConsoleApp:
             "delete": [name, body],
             "test": [name],
             "users": [name],
+            "unlock": [name, body],
             "policy_get": [],
             "policy_put": [body],
         }
@@ -1874,8 +1876,9 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             raise ConsoleError("INVALID_REQUEST", "Content-Length 无效", status=400)
         if length < 0:
             raise ConsoleError("INVALID_REQUEST", "Content-Length 无效", status=400)
-        if length > MAX_BODY_BYTES:
-            raise ConsoleError("PAYLOAD_TOO_LARGE", "请求体过大（上限 1 MiB）", status=413)
+        limit = getattr(self, '_request_body_limit', MAX_BODY_BYTES)
+        if length > limit:
+            raise ConsoleError("PAYLOAD_TOO_LARGE", "请求体过大（上限 %d MiB）" % (limit >> 20), status=413)
         if length == 0:
             return b""
         data = self.rfile.read(length)
@@ -1925,6 +1928,19 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             split = urllib.parse.urlsplit(self.path)
             decoded_path = urllib.parse.unquote(split.path or "/")
             query = urllib.parse.parse_qs(split.query or "", keep_blank_values=True)
+            self._request_body_limit = MAX_BODY_BYTES
+            if method == 'POST' and decoded_path.rstrip('/') == '/api/imports/preview':
+                # Authenticate before accepting a larger body, including on keep-alive connections.
+                session = self._session()
+                if session is None:
+                    self.close_connection = True
+                    raise ConsoleError('AUTH_REQUIRED', '需要登录', status=401)
+                try:
+                    self._require_csrf(session)
+                except ConsoleError:
+                    self.close_connection = True
+                    raise
+                self._request_body_limit = MAX_IMPORT_BODY_BYTES
             if method in ("POST", "PUT", "DELETE", "PATCH"):
                 self._body = self._parse_json_object(self._read_body_bytes())
             else:
@@ -2100,6 +2116,11 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             self._require_method(method, ("GET",))
             name = _validate_name(tail[0], field="name")
             self._send_ok(200, app.call_handler("users", name=name), head=head)
+            return
+        if app.tool == "ssh" and len(tail) == 2 and tail[1] == "unlock":
+            self._require_method(method, ("POST",))
+            name = _validate_name(tail[0], field="name")
+            self._send_ok(200, app.call_handler("unlock", name=name, body=self._body), head=head)
             return
         raise ConsoleError("NOT_FOUND", "接口不存在", status=404)
 

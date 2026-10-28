@@ -17,7 +17,7 @@ CONSOLE_MODULES = (
     'bindkit_console.py', 'bindkit_policy.py', 'bindkit_vault.py',
     'bindkit_privilege.py', 'bindkit_connections.py', 'bindkit_ai.py',
     'bindkit_catalog.py', 'bindkit_imports.py', 'bindkit_admin.py',
-    'bindkit_orchestration.py',
+    'bindkit_orchestration.py', 'bindkit_xshell_crypto.py', 'bindkit_pending.py',
 )
 
 
@@ -36,7 +36,7 @@ def build_integrations_runtime(runtime, requirements):
                         '--retries', '1', '-r', str(requirements)],
                        check=True, env=environment, capture_output=True, timeout=300)
         # Import checks do not select or access an OS keychain backend.
-        subprocess.run([str(interpreter), '-I', '-c', 'import keyring, openai'],
+        subprocess.run([str(interpreter), '-I', '-c', 'import keyring, openai; from Crypto.Cipher import ARC4'],
                        check=True, env=environment, capture_output=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         raise RuntimeError('Optional integration runtime setup failed. Check Python venv/pip support and access to PyPI, then retry --with-integrations. Existing installation was preserved.') from None
@@ -141,9 +141,9 @@ def install(source, home, bin_dir=None, console_dir=None, data_dir=None,
                     and (prior_runtime / 'bin/python').is_file()
                     and os.access(prior_runtime / 'bin/python', os.X_OK)
                     and (prior_runtime / '.bindkit-runtime.json').is_file())
-        if reusable and (not with_integrations or prior_metadata.get('requirements_sha256') == digest):
+        if reusable and prior_metadata.get('requirements_sha256') == digest:
             runtime, runtime_metadata = prior_runtime, prior_metadata
-        elif not with_integrations:
+        elif not with_integrations and not reusable:
             raise RuntimeError('Previously enabled integration runtime is missing or damaged; rerun with --with-integrations. Existing installation was preserved.')
         else:
             data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
