@@ -211,7 +211,8 @@ def auth_ssh_opts(auth):
     mode = auth["mode"]
 
     if mode == AUTH_PASSWORD:
-        opts += ["-o", "PubkeyAuthentication=no",
+        opts += ["-o", "BatchMode=no", "-o", "PubkeyAuthentication=no",
+                 "-o", "PasswordAuthentication=yes", "-o", "KbdInteractiveAuthentication=yes",
                  "-o", "PreferredAuthentications=password,keyboard-interactive",
                  "-o", "NumberOfPasswordPrompts=1"]
         handle = SecretHandle(auth["password"])
@@ -223,6 +224,7 @@ def auth_ssh_opts(auth):
                  "-o", "PreferredAuthentications=publickey",
                  "-o", "NumberOfPasswordPrompts=1"]
         if auth.get("passphrase"):
+            opts += ["-o", "BatchMode=no"]
             handle = SecretHandle(auth["passphrase"])
 
     elif mode == AUTH_AGENT:
@@ -536,7 +538,7 @@ def classify_ssh_error(rc, err, out, timeout=120):
     e = err or ""
     if rc == 124:
         return "连接超时"
-    if "Permission denied" in e or "Authentication failed" in e:
+    if rc == 255 and ("Permission denied" in e or "Authentication failed" in e):
         return "认证失败：凭据不正确，或服务器不接受这种认证方式"
     if "no such identity" in e or "No such file or directory" in e:
         return "找不到指定的私钥文件"
@@ -628,8 +630,8 @@ def find_certificate(keyfile):
 REMOTE_INSTALL = (
     "set -e; umask 077; "
     'if [ -z "$HOME" ] || [ ! -d "$HOME" ]; then echo "SSHBIND_NO_HOME"; exit 1; fi; '
-    "mkdir -p ~/.ssh; chmod 700 ~/.ssh; "
-    "touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; "
+    "if ! mkdir -p ~/.ssh || ! chmod 700 ~/.ssh; then echo SSHBIND_WRITE_FAILED; exit 1; fi; "
+    "if ! touch ~/.ssh/authorized_keys || ! chmod 600 ~/.ssh/authorized_keys; then echo SSHBIND_WRITE_FAILED; exit 1; fi; "
     'KEY="$(cat)"; '
     'if [ -z "$KEY" ]; then echo "SSHBIND_EMPTY_KEY"; exit 1; fi; '
     'if grep -qxF "$KEY" ~/.ssh/authorized_keys 2>/dev/null; then echo "SSHBIND_ALREADY"; '
@@ -855,6 +857,51 @@ def validate_name(name):
 # 子命令
 # ---------------------------------------------------------------------------
 
+_BOOTSTRAP_FAILURES = {
+    'AUTHENTICATION_FAILED': '密码认证未通过：请检查登录用户、原始密码及服务器是否允许密码认证。特殊字符无需转义。',
+    'REMOTE_KEY_INSTALL_FAILED': '服务器未能保存公钥：请检查该用户的家目录和 .ssh/authorized_keys 写入权限。',
+    'KEY_LOGIN_VERIFICATION_FAILED': '密码认证和公钥写入已完成，但后续密钥登录验证失败；请检查服务器公钥认证及家目录权限。',
+    'CONNECTION_TIMEOUT': '首次连接超时，请检查服务器地址、端口和网络。',
+    'CONNECTION_REFUSED': '服务器拒绝连接，请检查端口和 SSH 服务。',
+    'HOST_KEY_VERIFICATION_FAILED': '服务器主机密钥校验失败，请由本人核对主机指纹。',
+    'FIRST_AUTH_FAILED': '首次认证或公钥安装未完成，请检查连接信息与服务器认证设置。',
+    'LOCAL_SETUP_FAILED': '本机密钥生成或连接保存未完成，请检查本地 OpenSSH 和存储权限。',
+}
+
+
+def _report_bootstrap_failure(code):
+    # Internal child-process protocol: only fixed codes, never exception/SSH text.
+    print('SSHBIND_FAILURE ' + json.dumps({'code': code}))
+
+
+def _bootstrap_install_code(detail):
+    detail = detail if isinstance(detail, str) else ''
+    for prefix, code in (
+            ('认证失败', 'AUTHENTICATION_FAILED'),
+            ('服务器上该用户的家目录', 'REMOTE_KEY_INSTALL_FAILED'),
+            ('写入远端 authorized_keys 失败', 'REMOTE_KEY_INSTALL_FAILED'),
+            ('连接超时', 'CONNECTION_TIMEOUT'),
+            ('连接被拒绝', 'CONNECTION_REFUSED'),
+            ('主机密钥校验失败', 'HOST_KEY_VERIFICATION_FAILED')):
+        if detail.startswith(prefix):
+            return code
+    return 'FIRST_AUTH_FAILED'
+
+
+def _raise_bootstrap_failure(output):
+    for line in reversed((output or '').splitlines()[-16:]):
+        if not line.startswith('SSHBIND_FAILURE ') or len(line) > 1024:
+            continue
+        try:
+            value = json.loads(line[len('SSHBIND_FAILURE '):])
+        except (ValueError, TypeError):
+            continue
+        code = value.get('code') if isinstance(value, dict) else None
+        if isinstance(code, str) and code in _BOOTSTRAP_FAILURES:
+            connections = _extension_module('bindkit_connections', required=True)
+            raise connections.ConnectionError(_BOOTSTRAP_FAILURES[code], code)
+
+
 def _cmd_add_verified(args):
     """Console-only transaction: publish an alias only after new-key verification.
 
@@ -879,15 +926,17 @@ def _cmd_add_verified(args):
         pubkey = read_pubkey(candidate_name)
         fingerprint = fingerprint_of(pubkey)
         certificate = find_certificate(priv)
-        installed, _ = install_pubkey(args.host, args.user, args.port, auth, pubkey,
+        installed, detail = install_pubkey(args.host, args.user, args.port, auth, pubkey,
                                        restrict=args.restrict)
         auth = None
         if not installed:
             warn("公钥安装未确认，未登记别名；可用正确登录密码重试。远端已有公钥未撤销。")
+            _report_bootstrap_failure(_bootstrap_install_code(detail))
             return 1
         verified, _ = test_connection(args.host, args.user, args.port, priv, certificate)
         if not verified:
             warn("公钥安装后登录验证失败，未登记别名；可用登录密码重新绑定。远端公钥未撤销。")
+            _report_bootstrap_failure('KEY_LOGIN_VERIFICATION_FAILED')
             return 1
         # main() holds the shared mutation lock. Re-read as an extra safeguard for
         # direct callers and never overwrite a newly-created alias.
@@ -906,6 +955,7 @@ def _cmd_add_verified(args):
         return 0
     except (Exception, SystemExit):
         warn("连接创建未完成，请检查凭据、网络与本地存储；远端已有公钥未撤销。")
+        _report_bootstrap_failure('LOCAL_SETUP_FAILED')
         return 1
     finally:
         if not committed:
@@ -1723,7 +1773,7 @@ def _console_ssh_create_transaction(body):
     try:
         pending = _extension_module("bindkit_pending", required=True)
         return pending.preserve_verified_password(_self_module(), body, lambda: _console_ssh_create(body))
-    except Exception:
+    except Exception as exc:
         # adopt 可能已保存记录、随后更新 SSH config 失败；这种情况保留密钥与策略。
         if name not in load_state()["servers"]:
             after = mod.read_policy("ssh")
@@ -1738,6 +1788,9 @@ def _console_ssh_create_transaction(body):
                         mod.write_policy("ssh", before["data"])
                     else:
                         os.remove(mod.tool_paths("ssh")["policy"])
+        code = getattr(exc, 'code', None)
+        if isinstance(code, str) and code in _BOOTSTRAP_FAILURES:
+            raise _console_fail(_BOOTSTRAP_FAILURES[code], code) from None
         raise _console_fail("创建连接失败，请检查连接信息、凭据与本地存储权限；未撤销远端已有公钥，可用正确密码或私钥重新绑定。", "CONNECTION_CREATE_FAILED") from None
 
 
@@ -1802,6 +1855,7 @@ def _console_ssh_create(body):
                                   "--port", str(port), "--password-stdin"],
                                  stdin_data=password + "\n")
         if rc != 0:
+            _raise_bootstrap_failure(out)
             raise _console_fail("添加连接失败，请检查登录凭据与网络。", "CONNECTION_CREATE_FAILED")
         row = load_state()["servers"].get(name) or {}
         return {"ok": True, "name": name, "auth": "password", "id": row.get("id")}

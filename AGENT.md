@@ -5,6 +5,8 @@ Run remote commands with `sshbind exec --json <alias> '<command>'`; place option
 Run SQL with `dbbind exec --json <alias> 'SELECT ...'`. Rows are ordered arrays; check `truncated` before interpreting totals.
 
 Never read or print passwords/private keys, connection strings or unmasked configuration.
+Passwords entered by the human are literal data; never ask them to shell-escape %, $, quotes or backslashes.
+Distinguish password authentication, remote key installation and later public-key login failures by their error codes; a connection failure does not by itself mean the password was altered.
 Let the user import credentials in the web console or edit their configuration directly.
 Do not add/remove real connections or revoke keys without explicit user instructions.
 

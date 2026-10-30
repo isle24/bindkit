@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.2.1 — 2026-10-30
+
+- Explicit password bootstrap enables password/keyboard-interactive authentication and overrides inherited BatchMode for that invocation; explicit key-passphrase bootstrap also allows prompting. Normal key execution retains BatchMode=yes.
+- Preserve literal special characters without additional escaping; add genuine loopback OpenSSH password, keyboard-interactive, child stdin, edit and pending-activation regression coverage.
+- Distinguish password authentication, remote authorized-key installation and subsequent key verification errors in the console and batch imports. Error messages use fixed allowlisted codes and never reflect credential/remote diagnostic text.
+
 ## v1.2.0 — 2026-10-28
 
 - Expand session import to multiple files, folders and ordinary ZIP/.xts exports: up to 1024 sessions and 16 MiB, sequential ten-row progress and per-row results.

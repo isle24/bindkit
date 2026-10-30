@@ -172,6 +172,21 @@ class AdminAPITests(unittest.TestCase):
         self.assertEqual(self.deferred[0]['password'], 'synthetic-deferred-secret')
         self.assertNotIn('synthetic-deferred-secret', response.text)
 
+    def test_import_reports_safe_ssh_failure_stage_without_reflecting_secret(self):
+        self.login()
+        preview = self.preview().data
+        row = {'id': preview['items'][0]['id'], 'login_password': 'synthetic%$DO_NOT_EXPAND'}
+        for code in ('AUTHENTICATION_FAILED', 'REMOTE_KEY_INSTALL_FAILED', 'KEY_LOGIN_VERIFICATION_FAILED'):
+            def fail(body, code=code):
+                raise bc.ConsoleError(code, body['password'])
+            self.server.app.handlers['create'] = fail
+            response = self.client.post('/api/imports/commit', {'preview_id': preview['preview_id'], 'items': [row]})
+            result = response.data['results'][0]
+            self.assertEqual(result.get('code'), code)
+            self.assertIn(code, result['error'])
+            self.assertTrue(result['can_add_unverified'])
+            self.assertNotIn(row['login_password'], response.text)
+
     def test_offline_flag_cannot_skip_initial_attempt_or_use_truthy_nonboolean(self):
         self.login()
         preview = self.preview().data

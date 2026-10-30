@@ -69,3 +69,5 @@ tests/test_privilege.py
 tests/test_pending_connections.py
 tests/test_xshell_crypto.py
 tests/test_vault.py
+tests/test_password_transport.py
+tests/test_bootstrap_errors.py

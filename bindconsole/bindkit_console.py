@@ -106,7 +106,7 @@ except ImportError:                     # pragma: no cover - Windows
 # 常量
 # ---------------------------------------------------------------------------
 
-KERNEL_VERSION = "1.2.0"
+KERNEL_VERSION = "1.2.1"
 VERSION = KERNEL_VERSION                      # 兼容别名
 
 ALLOWED_TOOLS = ("ssh", "db")

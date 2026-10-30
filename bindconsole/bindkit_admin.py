@@ -7,6 +7,12 @@ import secrets
 import threading
 import time
 
+_SSH_FAILURE_HINTS = {
+    'AUTHENTICATION_FAILED': '密码认证未通过，请检查登录用户、密码和服务器认证设置',
+    'REMOTE_KEY_INSTALL_FAILED': '服务器未能写入公钥，请检查家目录与 .ssh 目录权限',
+    'KEY_LOGIN_VERIFICATION_FAILED': '密码认证和公钥写入已完成，但后续免密登录验证失败',
+}
+
 
 class AdminError(Exception):
     def __init__(self, code, message, status=400):
@@ -195,9 +201,14 @@ class AdminAPI:
                         existing.add(name)
                         preview['credentials'].pop(item['id'], None)
                         preview['failed'].discard(item['id'])
-                    except Exception:
-                        result['error'] = ('先添加失败，请检查本地存储与系统钥匙串' if deferred else
-                            '连接或凭据验证未通过；可确认先添加为待验证连接')
+                    except Exception as exc:
+                        code = getattr(exc, 'code', None)
+                        if not deferred and isinstance(code, str) and code in _SSH_FAILURE_HINTS:
+                            result['code'] = code
+                            result['error'] = _SSH_FAILURE_HINTS[code] + '（' + code + '）；可确认先添加为待验证连接'
+                        else:
+                            result['error'] = ('先添加失败，请检查本地存储与系统钥匙串' if deferred else
+                                '连接或凭据验证未通过；可确认先添加为待验证连接')
                         result['can_add_unverified'] = not deferred
                         if not deferred:
                             preview['failed'].add(item['id'])

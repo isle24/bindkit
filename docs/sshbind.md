@@ -2,6 +2,7 @@
 
 `sshbind add NAME --host HOST [--user USER] [--port PORT]` 首次认证后安装专用公钥。
 默认交互输入密码；也可用 `--identity PATH` 或 `--agent` 首次认证。
+Web/交互输入的密码按原样传递，`%`、`$`、引号、反斜线无需额外转义。显式密码/私钥口令认证会覆盖全局 BatchMode 设置；日常密钥执行仍禁止密码回退。
 已有私钥的口令可用 `--identity-passphrase-stdin` 从 stdin 读入。
 
 `sshbind adopt NAME --host HOST --identity PATH` 只纳管并验证既有密钥，不向远端推送公钥。
@@ -28,6 +29,8 @@ FinalShell 先预览：`sshbind import finalshell`；明确执行密码型连接
 
 Web 中的 sudo=allow/ask/deny 通过策略守卫作用于 exec；默认无策略时保持原兼容行为。
 它不能撤销 root 账号本身的权限，也不能代替 sudoers。
+
+添加失败的提示区分 `AUTHENTICATION_FAILED`（密码认证）、`REMOTE_KEY_INSTALL_FAILED`（远端公钥写入）和 `KEY_LOGIN_VERIFICATION_FAILED`（密码认证、公钥写入已完成，但免密验证失败），不回显密码或原始诊断文本。
 
 ## 无需删除别名的凭据维护
 
