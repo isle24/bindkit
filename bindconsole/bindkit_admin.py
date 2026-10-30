@@ -11,6 +11,7 @@ _SSH_FAILURE_HINTS = {
     'AUTHENTICATION_FAILED': '密码认证未通过，请检查登录用户、密码和服务器认证设置',
     'REMOTE_KEY_INSTALL_FAILED': '服务器未能写入公钥，请检查家目录与 .ssh 目录权限',
     'KEY_LOGIN_VERIFICATION_FAILED': '密码认证和公钥写入已完成，但后续免密登录验证失败',
+    'REMOTE_HOME_PERMISSIONS_UNSAFE': '服务器家目录允许组/其他用户写入，可能被 StrictModes 拦截，请由本人核对目录权限',
 }
 
 

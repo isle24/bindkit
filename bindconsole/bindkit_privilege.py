@@ -96,7 +96,7 @@ def _error(code, message):
     return {'code': code, 'message': message}
 
 
-def execute_plan(ssh_module, server, plan, vault, stdin_data=None, timeout=120):
+def execute_plan(ssh_module, server, plan, vault, stdin_data=None, timeout=120, transport=None):
     """Never send command input until sudo has started the nonce-bound wrapper.
 
     No PTY is allocated: requiretty, PAM multi-factor and interactive su are unsupported.
@@ -112,8 +112,13 @@ def execute_plan(ssh_module, server, plan, vault, stdin_data=None, timeout=120):
         remote = 'sudo -S -p ' + shlex.quote(prompt.decode()) + ' -u ' + shlex.quote(plan['target_user']) + ' -- sh -c ' + shlex.quote(inner)
     else:
         remote = 'sh -c ' + shlex.quote(inner)
-    argv = ssh_module.ssh_with_key(server['host'], server['user'], server.get('port', 22),
-                                    server['key'], server.get('certificate')) + [remote]
+    if transport is None:
+        argv = ssh_module.ssh_with_key(server['host'], server['user'], server.get('port', 22),
+                                        server['key'], server.get('certificate')) + [remote]
+        environment = None
+    else:
+        base_argv, environment = transport
+        argv = list(base_argv) + [remote]
     if os.path.basename(argv[0]) == 'ssh': argv.insert(1, '-T')
     payload = stdin_data.encode('utf-8') if isinstance(stdin_data, str) else (stdin_data or b'')
     if not isinstance(payload, bytes): raise ValueError('stdin_data must be bytes or text')
@@ -124,7 +129,7 @@ def execute_plan(ssh_module, server, plan, vault, stdin_data=None, timeout=120):
     output_limit = 8 * 1024 * 1024
     try:
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                start_new_session=True)
+                                start_new_session=True, **({'env': environment} if transport is not None else {}))
         for stream, label in ((proc.stdout, 'out'), (proc.stderr, 'err')):
             os.set_blocking(stream.fileno(), False); selector.register(stream, selectors.EVENT_READ, label)
         os.set_blocking(proc.stdin.fileno(), False)

@@ -1,5 +1,8 @@
 # sshbind
 
+Web 添加/导入时选择密码即为真正的密码登录：验证密码后存入本机系统钥匙串，后续 `sshbind exec` 自动认证；不安装公钥、不修改服务器家目录或 SSH 配置。普通密码连接不需要公钥认证可用。
+密码通过私有内存 askpass 通道交给 OpenSSH，临时辅助文件只含程序代码，不含密码。密码连接请使用 sshbind 命令；原生 `ssh <alias>` 无法读取 BindKit 的钥匙串凭据。
+
 `sshbind add NAME --host HOST [--user USER] [--port PORT]` 首次认证后安装专用公钥。
 默认交互输入密码；也可用 `--identity PATH` 或 `--agent` 首次认证。
 Web/交互输入的密码按原样传递，`%`、`$`、引号、反斜线无需额外转义。显式密码/私钥口令认证会覆盖全局 BatchMode 设置；日常密钥执行仍禁止密码回退。
@@ -31,10 +34,11 @@ Web 中的 sudo=allow/ask/deny 通过策略守卫作用于 exec；默认无策�
 它不能撤销 root 账号本身的权限，也不能代替 sudoers。
 
 添加失败的提示区分 `AUTHENTICATION_FAILED`（密码认证）、`REMOTE_KEY_INSTALL_FAILED`（远端公钥写入）和 `KEY_LOGIN_VERIFICATION_FAILED`（密码认证、公钥写入已完成，但免密验证失败），不回显密码或原始诊断文本。
+`REMOTE_HOME_PERMISSIONS_UNSAFE` 表示观测到服务器家目录允许组/其他用户写入，可能触发 OpenSSH StrictModes 拒绝公钥。由本人核对实际家目录并调整权限；工具仅报告权限，不自动修改家目录或 SSH 安全配置。
 
 ## 无需删除别名的凭据维护
 
-Web 编辑允许更新 host/user/port、登录密码或私钥。登录密码仅用于安装替换公钥，不修改远端密码。
+Web 编辑允许更新 host/user/port、登录密码或私钥。密码连接会验证并更新本机保存的密码；既有密钥连接仍可显式重绑公钥。不修改远端账号密码。
 验证成功才保存连接；旧本机和远端密钥保留，不自动吊销。sudo 密码为独立的仅写入字段，保存到运行 BindKit 本机的系统钥匙串。
 安装可选依赖：`bash install.sh --with-integrations`。字段留空不修改，显式清除会删除对应钥匙串项。
 

@@ -19,7 +19,7 @@ class BootstrapErrorTests(unittest.TestCase):
     synthetic_create_transport = fixtures.CLIIntegrationTests.synthetic_create_transport
 
     def body(self, **kwargs):
-        return dict(name='literal-password', host='example.invalid', user='operator',
+        return dict(auth_type='key', name='literal-password', host='example.invalid', user='operator',
                     password='synthetic%$DO_NOT_EXPAND', **kwargs)
 
     def assert_safe_failure(self, body, code):
@@ -81,6 +81,34 @@ class BootstrapErrorTests(unittest.TestCase):
     def test_remote_command_permission_denied_is_not_password_authentication(self):
         detail = self.ssh.classify_ssh_error(1, 'mkdir: Permission denied', '')
         self.assertFalse(detail.startswith('认证失败'))
+
+    def test_world_writable_home_is_reported_without_changing_it(self):
+        home = Path(self.temp.name)
+        helpers = home / 'stat-tools'; helpers.mkdir()
+        stat = helpers / 'stat'
+        stat.write_text('#!/bin/sh\nprintf "777\\n"\n'); stat.chmod(0o700)
+        original_mode = home.stat().st_mode
+        result = subprocess.run(['/bin/sh', '-c', self.ssh.REMOTE_INSTALL],
+            env=dict(os.environ, HOME=str(home), PATH=str(helpers) + os.pathsep + os.defpath),
+            input=b'ssh-ed25519 synthetic-public', capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b'SSHBIND_HOME_WRITABLE', result.stdout)
+        self.assertEqual(home.stat().st_mode, original_mode)
+
+    def test_failed_key_login_reports_observed_unsafe_home(self):
+        def install(host, user, port, auth, pubkey, **kwargs):
+            auth['_sshbind_home_writable'] = True
+            return True, 'synthetic installed'
+        with self.synthetic_create_transport(verify_ok=False), \
+                patch.object(self.ssh, 'install_pubkey', side_effect=install):
+            self.assert_safe_failure(self.body(), 'REMOTE_HOME_PERMISSIONS_UNSAFE')
+
+    def test_home_diagnostic_does_not_block_a_successful_key_login(self):
+        def install(host, user, port, auth, pubkey, **kwargs):
+            auth['_sshbind_home_writable'] = True
+            return True, 'synthetic installed'
+        with self.synthetic_create_transport(), patch.object(self.ssh, 'install_pubkey', side_effect=install):
+            self.assertTrue(self.ssh.console_ssh_create(self.body())['ok'])
 
 
 if __name__ == '__main__': unittest.main()

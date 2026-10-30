@@ -19,6 +19,8 @@ bindconsole/bindkit_imports.py
 bindconsole/bindkit_orchestration.py
 bindconsole/bindkit_privilege.py
 bindconsole/bindkit_pending.py
+bindconsole/bindkit_password.py
+bindconsole/bindkit_askpass.py
 bindconsole/bindkit_xshell_crypto.py
 bindconsole/bindkit_vault.py
 bindconsole/web/index.html
@@ -71,3 +73,8 @@ tests/test_xshell_crypto.py
 tests/test_vault.py
 tests/test_password_transport.py
 tests/test_bootstrap_errors.py
+tests/test_memory_askpass.py
+tests/test_password_connections.py
+tests/test_password_cli.py
+tests/test_password_db_boundary.py
+docs/superpowers/specs/2026-10-30-password-connections.md

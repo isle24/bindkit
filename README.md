@@ -11,7 +11,7 @@ It runs on macOS and Linux with Python 3.9+; the core has no pip dependencies.
 
 | 工具 | 用途 |
 |---|---|
-| `sshbind` | 密码/已有私钥/SSH agent 首次认证，生成或纳管密钥，FinalShell 导入，远程执行 |
+| `sshbind` | Web 密码登录与钥匙串保存，私钥/SSH agent 认证，显式公钥绑定，会话导入，远程执行 |
 | `dbbind` | MySQL、PostgreSQL、SQLite；配置文件管理；结构查询、SQL 执行、导出 |
 | Web 控制台 | 服务器/数据库管理、凭据编辑、会话导入、人工/AI 审批和分页审计 |
 
@@ -27,7 +27,7 @@ curl -fsSL https://github.com/isle24/bindkit/releases/latest/download/install.sh
 已有连接、私钥、密码、策略、审批和管理密码保持不变；替换已有程序前会在旁边留下备份。
 首次安装不会替你配置连接或创建管理密码。
 
-需要系统钥匙串代输 sudo 密码或独立 AI 审批时，加上可选集成运行时：
+需要密码连接、系统钥匙串代输 sudo 密码或独立 AI 审批时，加上可选集成运行时：
 
 ```bash
 curl -fsSL https://github.com/isle24/bindkit/releases/latest/download/install.sh | bash -s -- --with-integrations
@@ -77,7 +77,9 @@ dbbind --startserver --open     # http://127.0.0.1:8791
 两个后台可同时运行，资源分开管理，共用管理密码。任一后台登出会使两边旧会话失效。
 Ctrl-C 关闭前台服务；需要后台运行可加 `--daemon`，PID/日志位于 `~/.bindconsole/run/`。
 
-也可以通过 CLI 绑定服务器，密码在终端交互输入：
+Web 中选择「密码登录」会直接使用该密码认证，验证成功后保存在本机系统钥匙串，不会自动安装公钥。后续通过 `sshbind exec` 自动取用密码；选择私钥则使用密钥认证。
+
+也可以显式通过 CLI 绑定公钥，密码在终端交互输入：
 
 ```bash
 sshbind add demo-server --host server.example.com --user deploy
@@ -90,14 +92,14 @@ sshbind exec --json demo-server 'uname -a'
 `sshbind exec` 的选项放在别名前；远端退出码原样返回。
 Web 粘贴导入的私钥会保留在 `~/.ssh/sshbind/keys/`，不能作为临时文件清理。
 在服务器的「编辑」中可以更换地址、端口、登录用户、登录密码或私钥，无需删除别名。
-登录密码用于安装并验证替换公钥，不会修改远端账号密码；验证失败保留原连接，旧密钥不自动吊销。
+密码连接可更新本机保存的登录密码，验证失败保留原连接。既有密钥连接的密码重绑和私钥替换仍需验证；旧密钥不自动吊销。
 sudo 密码是独立字段，仅存入本机系统钥匙串；空字段保留原值，清除操作需要显式勾选。
 
 服务器页的「导入会话」支持多选文件、整个会话目录、Xshell `.xsh`（含 UTF-16）、ZIP 格式 `.xts` 导出包、FinalShell SSH JSON、OpenSSH config。
 每批最多 1024 个文件/会话、总计 16 MiB，按每十条显示进度和结果。已有别名不会被覆盖。
 Xshell 已保存密码可用一次主密码，或源 Windows 用户名/SID 批量解锁；恢复的密码不用逐台重填，导入后存入本机系统钥匙串。
 没有解锁信息时会明确提示，未解锁密文可随待验证连接保留到钥匙串，稍后通过「解锁 Xshell 密码」补充信息。
-暂时无法连接时，界面会询问是否先添加为「待验证」；只有明确确认才保存，`usable:false`，稍后「测试连接」验证成功后激活。
+暂时无法连接时，界面会询问是否先添加为「待验证」；只有明确确认才保存，`usable:false`，稍后按保存的认证方式「测试连接」，成功后激活。密码连接不要求服务器允许公钥登录。
 解密支持已验证的 Xshell 1–8 会话算法，未知版本和未知容器不会猜测。低于 5.1 的厂商格式没有完整性摘要。此功能需要可选集成运行时（含 PyCryptodome）。
 更多认证、证书和 FinalShell 迁移说明见 [SSH 使用指南](docs/sshbind.md)。
 
@@ -220,7 +222,7 @@ python3 scripts/check_release.py
 python3 scripts/build_release.py
 ```
 
-测试使用隔离 HOME、临时 SQLite 和假 SSH 传输，不访问维护者真实设施。
+测试使用隔离 HOME、临时 SQLite、模拟传输与仅监听本机的 SSH 测试服务器，不访问维护者真实设施。
 CI 在 Linux/macOS 执行测试；支持范围与版本记录见 [CHANGELOG.md](CHANGELOG.md)。
 核心不依赖 pip；FinalShell 密码迁移需要可用 DES 后端（cryptography、pycryptodome 或支持 DES 的 OpenSSL）。
 暂不支持原生 Windows。发布包不含个人连接、密钥、数据库文件、截图和运行日志。

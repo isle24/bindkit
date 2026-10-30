@@ -1,5 +1,7 @@
 # dbbind
 
+数据库的 SSH/Docker-over-SSH 通道使用原生 OpenSSH，须选择密钥别名。BindKit 密码连接通过 `sshbind exec` 取用钥匙串凭据；这类别名不会被静默当作系统 SSH 别名执行。
+
 引擎：mysql/postgres/sqlite。配置文件支持 JSONC 注释、尾随逗号及环境变量 `$VAR` / `${VAR}`；
 `$$` 表示字面 `$`。未知字段会产生 warnings；先运行 `dbbind config validate` 排查拼写。
 

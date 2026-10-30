@@ -91,6 +91,28 @@ class IsolatedPasswordTests(IsolatedHome):
         command = self.ssh.ssh_with_key('127.0.0.1', 'synthetic', 22, str(self.home / 'synthetic-key'))
         self.assertIn('BatchMode=yes', command)
         self.assertNotIn('BatchMode=no', command)
+        self.assertIn('PubkeyAuthentication=yes', command)
+
+    def test_key_login_probe_succeeds_without_optional_identity_commands(self):
+        empty_bin = self.home / 'empty-bin'
+        empty_bin.mkdir()
+        observed = []
+
+        def run_local_probe(command, **kwargs):
+            # Execute only the source probe command in an isolated local shell.
+            # No SSH client or server is contacted by this regression.
+            result = subprocess.run(['/bin/sh', '-c', command[-1]],
+                env=dict(os.environ, PATH=str(empty_bin)), capture_output=True, text=True,
+                timeout=5)
+            observed.append(result)
+            return result.returncode, result.stdout, result.stderr
+
+        with patch.object(self.ssh, 'run_ssh', side_effect=run_local_probe):
+            alive, _ = self.ssh.test_connection('example.invalid', 'synthetic', 22,
+                str(self.home / 'synthetic-key'))
+        self.assertEqual(len(observed), 1)
+        self.assertIn('SSHBIND_OK', observed[0].stdout)
+        self.assertTrue(alive, 'An available SSH shell must not fail because optional identity commands are missing')
 
     def test_cli_stdin_and_interactive_input_preserve_literal_characters(self):
         for label, password in PASSWORDS:
@@ -143,6 +165,10 @@ if paramiko:
             correct = username == 'synthetic' and password == self.owner.password
             self.owner.authentication.append(correct)
             return paramiko.AUTH_SUCCESSFUL if correct else paramiko.AUTH_FAILED
+
+        def check_auth_publickey(self, username, key):
+            self.owner.key_authentication.append(False)
+            return paramiko.AUTH_FAILED
 
         def check_auth_interactive(self, username, submethods):
             prompts = [('Password: ', False)]
@@ -197,6 +223,7 @@ class LocalPasswordServer:
         self.interactive = interactive
         self.multifactor = multifactor
         self.authentication = []
+        self.key_authentication = []
         self.interactive_response_matches = []
         self.commands = []
         self.stdin = b''
@@ -212,6 +239,19 @@ class LocalPasswordServer:
     def __enter__(self):
         self.thread.start()
         return self
+
+    def finish_session(self, channel, output, status):
+        channel.sendall(output)
+        channel.send_exit_status(status)
+        channel.shutdown_write()
+        channel.close()
+        # Transport.close() immediately tears down the TCP socket. Let the
+        # client receive CHANNEL_CLOSE and send its SSH disconnect first;
+        # otherwise OpenSSH can report Broken pipe despite a successful auth.
+        # Paramiko's transport thread exits on peer disconnect or TCP EOF.
+        self.transport.join(5)
+        if self.transport.is_alive():
+            raise TimeoutError('Synthetic SSH client did not finish disconnecting')
 
     def serve(self):
         try:
@@ -233,9 +273,7 @@ class LocalPasswordServer:
                         if not chunk:
                             break
                         self.stdin += chunk
-                    channel.sendall(self.output)
-                    channel.send_exit_status(self.status)
-                    channel.shutdown_write()
+                    self.finish_session(channel, self.output, self.status)
         except Exception as exc:
             self.errors.append(type(exc).__name__)
         finally:
@@ -288,16 +326,13 @@ class LocalBootstrapServer(LocalPasswordServer):
                         if phase == 0:
                             parts = payload.decode('utf-8').split()
                             if len(parts) < 2 or parts[0] != 'ssh-ed25519':
-                                channel.sendall(b'SSHBIND_EMPTY_KEY\n')
-                                channel.send_exit_status(1)
+                                self.finish_session(channel, b'SSHBIND_EMPTY_KEY\n', 1)
                                 return
                             self.authorized_keys.add((parts[0], parts[1]))
                             output = b'SSHBIND_ADDED\n'
                         else:
                             output = b'SSHBIND_OK\nsynthetic-host\nsynthetic\n'
-                        channel.sendall(output)
-                        channel.send_exit_status(0)
-                        channel.shutdown_write()
+                        self.finish_session(channel, output, 0)
                 self.transport.close()
                 self.transport = None
         except Exception as exc:
@@ -305,6 +340,42 @@ class LocalBootstrapServer(LocalPasswordServer):
         finally:
             if self.transport:
                 self.transport.close()
+
+
+class LocalPasswordConnectionServer(LocalPasswordServer):
+    """Repeated password-only sessions; never execute captured shell commands."""
+    def __init__(self, host_key, password, responses):
+        super().__init__(host_key, password)
+        self.responses = responses
+        self.payloads = []
+
+    def serve(self):
+        try:
+            for output, status in self.responses:
+                client, _ = self.listener.accept()
+                with client:
+                    self.transport = paramiko.Transport(client)
+                    self.transport.add_server_key(self.host_key)
+                    session = PasswordOnlySession(self)
+                    self.transport.start_server(server=session)
+                    channel = self.transport.accept(10)
+                    if channel is None: return
+                    with channel:
+                        channel.settimeout(10)
+                        if not session.executed.wait(10): return
+                        payload = bytearray()
+                        while True:
+                            chunk = channel.recv(4096)
+                            if not chunk: break
+                            payload.extend(chunk)
+                        self.payloads.append(bytes(payload))
+                        self.finish_session(channel, output, status)
+                self.transport.close()
+                self.transport = None
+        except Exception as exc:
+            self.errors.append(type(exc).__name__)
+        finally:
+            if self.transport: self.transport.close()
 
 
 class MemoryVault:
@@ -423,29 +494,38 @@ class OpenSSHPasswordTests(IsolatedHome):
         bin_dir = self.home / 'bin'
         bin_dir.mkdir()
         wrapper = bin_dir / 'ssh'
-        for inherited_batchmode in (False, True):
-            with self.subTest(inherited_batchmode=inherited_batchmode):
+        for config_case, config_text in (
+                ('default', None),
+                ('inherited', 'Host *\n  BatchMode yes\n'),
+                ('pubkey-disabled', 'Host *\n  PubkeyAuthentication no\n')):
+            with self.subTest(config_case=config_case):
                 options = list(self.isolation_options)
-                if inherited_batchmode:
+                if config_text:
                     config = self.home / 'bootstrap_client_config'
-                    config.write_text('Host *\n  BatchMode yes\n', encoding='utf-8')
+                    config.write_text(config_text, encoding='utf-8')
                     options[1] = str(config)
                 wrapper.write_text('#!/bin/sh\nexec ' + shlex.join([self.ssh_binary, *options]) + ' "$@"\n', encoding='utf-8')
                 wrapper.chmod(0o700)
-                name = 'bootstrap-inherited' if inherited_batchmode else 'bootstrap-default'
+                name = 'bootstrap-' + config_case
                 # The source CLI is launched by the real _run_self. No CLI,
                 # key generation, authentication or verification helper is stubbed.
                 with patch.dict(os.environ, {'PATH': str(bin_dir) + os.pathsep + os.environ.get('PATH', '')}), \
                      LocalBootstrapServer(self.host_key, password) as server:
-                    result = self.ssh.console_ssh_create({'name': name, 'host': '127.0.0.1',
-                        'user': 'synthetic', 'port': server.port, 'password': password})
+                    failure = None
+                    try:
+                        result = self.ssh.console_ssh_create({'name': name, 'auth_type': 'key', 'host': '127.0.0.1',
+                            'user': 'synthetic', 'port': server.port, 'password': password})
+                    except Exception as exc:
+                        failure = getattr(exc, 'code', type(exc).__name__)
+                self.assertIsNone(failure, 'Synthetic full bootstrap failed: ' + str(failure))
                 self.assertTrue(result['ok'])
                 self.assertEqual(server.authentication, [True])
                 self.assertTrue(server.key_authentication, 'No public-key authentication was attempted')
                 self.assertTrue(all(server.key_authentication), 'The verification key did not match the installed key')
                 self.assertEqual(len(server.authorized_keys), 1)
-                self.assertEqual(server.commands, [self.ssh.REMOTE_INSTALL.encode('utf-8'),
-                    b'echo SSHBIND_OK && hostname && whoami'])
+                self.assertEqual(len(server.commands), 2)
+                self.assertEqual(server.commands[0], self.ssh.REMOTE_INSTALL.encode('utf-8'))
+                self.assertIn(b'SSHBIND_OK', server.commands[1])
                 self.assertEqual(len(server.payloads), 2)
                 self.assertTrue(server.payloads[0].startswith(b'ssh-ed25519 '))
                 self.assertEqual(server.payloads[1], b'')
@@ -509,7 +589,7 @@ class OpenSSHPasswordTests(IsolatedHome):
     def test_saved_pending_password_reaches_real_password_authentication(self):
         password = dict(PASSWORDS)['mixed']
         vault = MemoryVault()
-        with LocalPasswordServer(self.host_key, password, output=b'SSHBIND_ADDED\n') as server, \
+        with LocalPasswordServer(self.host_key, password, output=b'SSHBIND_OK\n') as server, \
              patch.object(self.ssh, 'ssh_base', side_effect=lambda *args: self.command(server)), \
              patch.object(self.ssh, 'test_connection', return_value=(True, ['synthetic-verification-stub'])), \
              contextlib.redirect_stdout(io.StringIO()):
@@ -520,7 +600,9 @@ class OpenSSHPasswordTests(IsolatedHome):
             self.assertTrue(result['ok'])
             self.assertTrue(result['usable'])
             self.assertEqual(server.authentication, [True])
-            self.assertTrue(server.stdin.startswith(b'ssh-ed25519 '))
+            self.assertEqual(server.stdin, b'')
+            self.assertEqual(len(server.commands), 1)
+            self.assertIn(b'SSHBIND_OK', server.commands[0])
 
     def test_authenticated_no_home_is_not_password_failure(self):
         password = dict(PASSWORDS)['mixed']

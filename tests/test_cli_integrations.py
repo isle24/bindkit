@@ -69,7 +69,7 @@ class CLIIntegrationTests(unittest.TestCase):
         with patch.object(self.ssh,'gen_keypair',side_effect=generate), patch.object(self.ssh,'fingerprint_of',return_value='SHA256:synthetic'), patch.object(self.ssh,'auth_ssh_opts',return_value=([],None)), patch.object(self.ssh,'run_ssh',side_effect=transport), patch.object(self.ssh,'_run_self',side_effect=run_self):
             yield status
     def test_web_password_install_failure_leaves_no_alias_and_allows_retry(self):
-        body={'name':'imported','host':'example.invalid','user':'operator','password':'synthetic-secret'}
+        body={'auth_type':'key','name':'imported','host':'example.invalid','user':'operator','password':'synthetic-secret'}
         original=set(Path(self.ssh.KEYS_DIR).iterdir())
         with self.synthetic_create_transport(install_ok=False) as status:
             with self.assertRaises(Exception): self.ssh.console_ssh_create(body)
@@ -79,7 +79,7 @@ class CLIIntegrationTests(unittest.TestCase):
             result=self.ssh.console_ssh_create(body)
         self.assertTrue(result['ok']); self.assertTrue(self.ssh.load_state()['servers']['imported']['installed'])
     def test_web_password_post_install_verification_failure_is_not_success(self):
-        body={'name':'imported','host':'example.invalid','user':'operator','password':'synthetic-secret'}
+        body={'auth_type':'key','name':'imported','host':'example.invalid','user':'operator','password':'synthetic-secret'}
         with self.synthetic_create_transport(verify_ok=False):
             with self.assertRaises(Exception): self.ssh.console_ssh_create(body)
         self.assertNotIn('imported',self.ssh.load_state()['servers'])
@@ -182,7 +182,7 @@ class CLIIntegrationTests(unittest.TestCase):
     def test_create_backend_error_does_not_reflect_secret(self):
         with patch.object(self.ssh,'_run_self',side_effect=RuntimeError('synthetic-secret')):
             with self.assertRaises(Exception) as error:
-                self.ssh.console_ssh_create({'name':'other','host':'example.invalid','password':'synthetic-secret'})
+                self.ssh.console_ssh_create({'auth_type':'key','name':'other','host':'example.invalid','password':'synthetic-secret'})
         self.assertNotIn('synthetic-secret',str(error.exception))
     def test_plain_stdin_keeps_binary_bytes(self):
         args=types.SimpleNamespace(name='demo',command=['cat'],json=True,timeout=10,as_user=None,stdin=True)

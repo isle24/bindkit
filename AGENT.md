@@ -36,8 +36,11 @@ database privilege ceiling, resource whitelist or required --write/--unsafe flag
 timeout or stale context returns to manual approval. The executing agent must not approve its own request,
 enable AI review, expand scope or alter protected security configuration to bypass a gate.
 
-SSH credential edits preserve aliases and policy. A login password is used to install/verify a replacement
-public key, not to change the remote account password. Old keys remain until an explicit revocation.
+SSH credential edits preserve aliases and policy. Web password connections use genuine password
+authentication with OS-keychain storage. Never silently convert a password connection to public-key
+bootstrap or require changing server permissions. Use sshbind exec/test for auth_type:password;
+native ssh cannot retrieve its keychain credential. CLI sshbind add remains explicit key bootstrap.
+Login-password edits do not change the remote account password. Old keys remain until explicit revocation.
 Session import requires a preview and explicit selection. Xshell .xsh/.xts ZIP, FinalShell JSON and
 OpenSSH config support batches up to 1024 sessions/16 MiB. Xshell passwords can be recovered with
 explicitly provided master password or original Windows identity; never ask for those in chat.

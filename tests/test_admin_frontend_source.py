@@ -49,6 +49,32 @@ const change=async(n,value)=>{n.value=value;await n.events.change({preventDefaul
 
 @unittest.skipUnless(shutil.which('node'), 'Node is required for frontend checks')
 class AdminFrontendTests(unittest.TestCase):
+    def test_password_form_selects_native_password_authentication(self):
+        script = FRONTEND_HARNESS + r'''
+(async()=>{
+ handler=(m,url,b)=>url==='/api/servers'?{servers:[]}:{};
+ BC.pages.servers(make('view'),{epoch:1});await flush();
+ const add=nodes.find(n=>n.tag==='button'&&n.textContent==='添加服务器');
+ await click(add);const form=modals.at(-1);
+ find('f-name').value='synthetic';find('f-host').value='example.invalid';find('f-user').value='operator';find('f-port').value='22';
+ find('f-password').value='synthetic%$LITERAL';
+ assert.strictEqual(form.validate(),null);
+ await form.onSubmit({close(){}});await flush();
+ const body=requests.find(r=>r.method==='post'&&r.url==='/api/servers').body;
+ assert.strictEqual(body.auth_type,'password');
+ assert.strictEqual(body.password,'synthetic%$LITERAL');
+ assert.strictEqual(find('f-password').value,'');
+ assert(nodes.some(n=>n.textContent==='密码登录'));
+ requests=[];nodes=[];
+ handler=(m,url,b)=>({servers:[{name:'password-demo',host:'example.invalid',user:'operator',port:22,auth_type:'password',has_login_credential:true,installed:true,usable:true}]});
+ BC.pages.servers(make('view'),{epoch:2});await flush();
+ assert(nodes.some(n=>n.textContent==='密码登录'));
+ console.log('Native password form checks passed');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+'''
+        result = subprocess.run(['node', '-e', script], cwd=ROOT, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_admin_workflows_with_synthetic_api(self):
         script = FRONTEND_HARNESS + r'''
 (async()=>{

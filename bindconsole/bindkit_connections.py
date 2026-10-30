@@ -15,7 +15,10 @@ class ConnectionError(RuntimeError):
 
 
 def public_credential_status(server, vault=None):
+    from bindkit_password import is_password
     return {'has_key': bool(server.get('key') and os.path.isfile(server['key'])),
+            'auth_type': 'password' if is_password(server) else 'key',
+            'has_login_credential': bool(server.get('login_credential_ref')),
             'sudo_auth': server.get('sudo_auth', 'none'),
             'has_sudo_credential': bool(server.get('sudo_credential_ref')),
             'keychain': vault.status() if vault else None}
@@ -79,8 +82,8 @@ def _validate(row, body):
 def update_connection(ssh_module, name, body, vault=None):
     """Verify first, stage new secrets, then commit config/state under an edit lock.
 
-    Old local and remote keys are retained. The login password is used solely for
-    installing a replacement public key through the existing SSH authentication helper.
+    Password connections verify directly with their login credential. Existing key
+    connections retain the explicit key bootstrap path and keep old keys.
     Caller must validate any combined policy request before invoking this operation.
     """
     if not isinstance(body, dict): raise ConnectionError('Request must be a JSON object.')
@@ -90,6 +93,9 @@ def update_connection(ssh_module, name, body, vault=None):
         state = ssh_module.load_state()
         old = state.get('servers', {}).get(name)
         if old is None: raise ConnectionError('Connection does not exist.', 'NOT_FOUND')
+        from bindkit_password import is_password, _update_locked
+        if 'private_key' not in body and (is_password(old) or (not old.get('key') and old.get('auth_type') != 'key')):
+            return _update_locked(ssh_module, name, body, state, old, vault)
         candidate = _validate(old, body)
         clearing = bool(body.get('clear_sudo_password') and old.get('sudo_credential_ref'))
         if 'sudo_password' in body or clearing:
@@ -109,7 +115,7 @@ def update_connection(ssh_module, name, body, vault=None):
                     os.fchmod(handle.fileno(), 0o600)
                     handle.write(body['private_key'].rstrip('\n') + '\n')
                 candidate['key'] = key; candidate['certificate'] = None
-                candidate['source'] = 'adopted'
+                candidate['source'] = 'adopted'; candidate['auth_type'] = 'key'
             elif 'login_password' in body:
                 os.makedirs(ssh_module.KEYS_DIR, mode=0o700, exist_ok=True)
                 key_name = name + '-rotation-' + uuid.uuid4().hex
@@ -136,6 +142,7 @@ def update_connection(ssh_module, name, body, vault=None):
                 if not valid:
                     raise ConnectionError('Replacement connection verification failed; the previous connection was retained.', 'CONNECTION_VERIFICATION_FAILED')
                 candidate['installed'] = True
+                candidate['verification_status'] = 'verified'; candidate['usable'] = True
             if 'sudo_password' in body:
                 new_ref = vault.new_ref('sudo')
                 vault.set(new_ref, body['sudo_password'])

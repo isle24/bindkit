@@ -38,7 +38,8 @@ def connection_context(record, tool='ssh'):
     result = {field: record.get(field) for field in fields}
     if tool == 'ssh':
         identity = {field: record.get(field) for field in
-                    ('key', 'fingerprint', 'certificate', 'created_at', 'sudo_auth', 'sudo_credential_ref')}
+                    ('key', 'fingerprint', 'certificate', 'created_at', 'sudo_auth', 'sudo_credential_ref',
+                     'auth_type', 'login_credential_ref', 'encrypted_login_ref')}
     else:
         identity = {field: record.get(field) for field in
                     ('engine', 'database', 'file', 'via', 'via_ssh', 'docker_exec', 'config_file')}

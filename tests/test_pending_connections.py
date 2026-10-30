@@ -48,7 +48,7 @@ class SSH:
     def __init__(self, base):
         self.KEYS_DIR = str(Path(base) / 'keys'); self.STATE_FILE = str(Path(base) / 'state.json')
         self.state = {'version': 1, 'servers': {}}; self.config = {}; self.installs = []; self.tests = []
-        self.valid = True; self.install_ok = True; self.fail_save = False; self.generated = []
+        self.valid = True; self.install_ok = True; self.fail_save = False; self.generated = []; self.password_calls = []
     def load_state(self): return copy.deepcopy(self.state)
     def save_state(self, state):
         if self.fail_save: raise OSError('synthetic write failure')
@@ -63,6 +63,13 @@ class SSH:
     def read_pubkey_for(self, key): return 'ssh-ed25519 synthetic-public'
     def fingerprint_of(self, pub): return 'SHA256:synthetic'
     def make_auth(self, mode, password=None): return {'mode': mode, 'password': password}
+    def ssh_base(self, host, user, port): return ['ssh', '-p', str(port)]
+    def auth_ssh_opts(self, auth):
+        self.password_calls.append(auth)
+        return ['-o', 'PubkeyAuthentication=no'], types.SimpleNamespace(env=lambda: {}, close=lambda: None)
+    def run_ssh(self, argv, **kwargs):
+        assert argv[-1] == "printf 'SSHBIND_OK\\n'"
+        return (0, 'SSHBIND_OK\n', '') if self.valid else (255, '', 'sensitive diagnostic')
     def install_pubkey(self, *args, **kwargs):
         self.installs.append((args, kwargs)); return self.install_ok, 'synthetic'
     def test_connection(self, *args, **kwargs):
@@ -140,7 +147,7 @@ class PendingConnectionsTests(unittest.TestCase):
         self.assertFalse(self.ssh.state['servers']); self.assertFalse(self.ssh.config); self.assertFalse(self.vault.values)
         self.assertEqual(list(Path(self.ssh.KEYS_DIR).iterdir()), [old])
     def test_saved_password_installs_and_verifies_then_activates_same_id(self):
-        self.create(password='synthetic-login'); old = copy.deepcopy(self.ssh.state['servers']['demo'])
+        self.create(password='synthetic-login', auth_type='key'); old = copy.deepcopy(self.ssh.state['servers']['demo'])
         result = self.verify(); row = self.ssh.state['servers']['demo']
         self.assertTrue(result['ok']); self.assertTrue(result['usable']); self.assertTrue(row['installed'])
         self.assertEqual(row['verification_status'], 'verified'); self.assertEqual(row['id'], old['id']); self.assertEqual(row['revision'], 2)
@@ -148,7 +155,7 @@ class PendingConnectionsTests(unittest.TestCase):
         self.assertEqual(self.vault.values[row['login_credential_ref']], 'synthetic-login')
         self.assertNotIn('synthetic-login', json.dumps(result)); self.assertNotIn('sensitive-secret-diagnostic', json.dumps(result))
     def test_failed_install_or_verification_keeps_pending_and_saved_credentials(self):
-        self.create(password='synthetic-login'); before = copy.deepcopy(self.ssh.state); saved = dict(self.vault.values)
+        self.create(password='synthetic-login', auth_type='key'); before = copy.deepcopy(self.ssh.state); saved = dict(self.vault.values)
         for install_ok, valid in ((False, True), (True, False)):
             self.ssh.install_ok = install_ok; self.ssh.valid = valid
             result = self.verify()
@@ -175,7 +182,7 @@ class PendingConnectionsTests(unittest.TestCase):
         self.assertFalse(result['ok']); self.assertEqual(self.ssh.state, before); self.assertEqual(self.ssh.config, before['servers'])
         self.assertTrue(Path(before['servers']['demo']['key']).exists())
     def test_uncertain_activation_commit_keeps_any_persisted_key_reference(self):
-        self.create(password='synthetic-login')
+        self.create(password='synthetic-login', auth_type='key')
         def uncertain_save(state):
             if state['servers']['demo'].get('installed'):
                 self.ssh.state = copy.deepcopy(state)
@@ -225,7 +232,8 @@ class PendingConnectionsTests(unittest.TestCase):
         self.assertFalse(wrong['ok']); self.assertEqual(self.ssh.state, before); self.assertEqual(self.vault.values, saved)
         correct = pending.unlock_credentials(self.ssh, 'demo', {'master_password': master}, self.vault)
         self.assertTrue(correct['ok']); self.assertFalse(self.ssh.installs); self.assertTrue(self.verify()['usable'])
-        self.assertEqual(self.ssh.installs[0][0][3]['password'], password.decode())
+        self.assertFalse(self.ssh.installs); self.assertFalse(self.ssh.generated)
+        self.assertEqual(self.ssh.password_calls[-1]['password'], password.decode())
 
 
 def load(name, path):
@@ -305,7 +313,7 @@ class PendingConsoleTests(unittest.TestCase):
     def test_normal_create_with_password_retention_fails_before_ssh_if_vault_unavailable(self):
         self.vault.available = False
         with self.assertRaises(Exception):
-            self.ssh.console_ssh_create({'name': 'demo', 'host': 'example.invalid', 'password': 'synthetic-login', 'preserve_password': True})
+            self.ssh.console_ssh_create({'name': 'demo', 'host': 'example.invalid', 'password': 'synthetic-login', 'preserve_password': True, 'auth_type': 'key'})
         self.assertFalse(self.ssh.load_state()['servers']); self.assertFalse(self.vault.values)
         self.ssh.run_ssh.assert_not_called()
     def test_verified_create_retains_password_only_after_successful_state_commit(self):
@@ -314,13 +322,13 @@ class PendingConsoleTests(unittest.TestCase):
             self.ssh.save_state({'servers': {'demo': self.ssh._record('demo', 'example.invalid', 'root', 22, str(key), 'fake', 'ed25519', False, None, 'generated', True)}})
             return {'ok': True, 'name': 'demo'}
         with patch.object(self.ssh, '_console_ssh_create', side_effect=create):
-            result = self.ssh.console_ssh_create({'name': 'demo', 'host': 'example.invalid', 'password': 'synthetic-login', 'preserve_password': True})
+            result = self.ssh.console_ssh_create({'name': 'demo', 'host': 'example.invalid', 'password': 'synthetic-login', 'preserve_password': True, 'auth_type': 'key'})
         row = self.ssh.load_state()['servers']['demo']; self.assertTrue(result['ok'])
         self.assertEqual(self.vault.values[row['login_credential_ref']], 'synthetic-login')
         self.assertTrue(self.ssh.console_ssh_get('demo')['has_login_credential']); self.assertNotIn('opaque-', json.dumps(result))
     def test_failed_verified_create_removes_staged_secret(self):
         with patch.object(self.ssh, '_console_ssh_create', side_effect=RuntimeError('synthetic')):
-            with self.assertRaises(Exception): self.ssh.console_ssh_create({'name': 'demo', 'host': 'example.invalid', 'password': 'synthetic-login', 'preserve_password': True})
+            with self.assertRaises(Exception): self.ssh.console_ssh_create({'name': 'demo', 'host': 'example.invalid', 'password': 'synthetic-login', 'preserve_password': True, 'auth_type': 'key'})
         self.assertFalse(self.vault.values)
     def test_retention_attach_save_failure_returns_failure_and_preserves_old_keys(self):
         self.ssh.ensure_dirs(); key = Path(self.ssh.KEYS_DIR) / 'demo'; key.write_text('synthetic')
@@ -333,7 +341,7 @@ class PendingConsoleTests(unittest.TestCase):
             return original_save(state)
         with patch.object(self.ssh, '_console_ssh_create', side_effect=create), patch.object(self.ssh, 'save_state', side_effect=save):
             with self.assertRaises(Exception):
-                self.ssh.console_ssh_create({'name': 'demo', 'host': 'example.invalid', 'password': 'synthetic-login', 'preserve_password': True})
+                self.ssh.console_ssh_create({'name': 'demo', 'host': 'example.invalid', 'password': 'synthetic-login', 'preserve_password': True, 'auth_type': 'key'})
         self.assertFalse(self.ssh.load_state()['servers']); self.assertFalse(self.vault.values); self.assertTrue(key.exists())
     def test_retention_refuses_changed_identity_without_removing_replacement(self):
         self.ssh.ensure_dirs(); key = Path(self.ssh.KEYS_DIR) / 'demo'; key.write_text('synthetic')
@@ -343,7 +351,7 @@ class PendingConsoleTests(unittest.TestCase):
             return {'ok': True, 'name': 'demo', 'id': 'prior-created-id'}
         with patch.object(self.ssh, '_console_ssh_create', side_effect=create):
             with self.assertRaises(Exception):
-                self.ssh.console_ssh_create({'name': 'demo', 'host': 'example.invalid', 'password': 'synthetic-login', 'preserve_password': True})
+                self.ssh.console_ssh_create({'name': 'demo', 'host': 'example.invalid', 'password': 'synthetic-login', 'preserve_password': True, 'auth_type': 'key'})
         self.assertEqual(self.ssh.load_state()['servers']['demo'], row); self.assertFalse(self.vault.values)
 
 

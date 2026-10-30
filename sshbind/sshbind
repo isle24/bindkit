@@ -17,8 +17,7 @@ sshbind — Linux 服务器 SSH 密钥绑定管理器
     sshbind list / show / test / pubkey / remove / doctor
 
 安全设计：
-  * 密码/口令只通过「临时文件 + SSH_ASKPASS」传给 ssh，绝不出现在命令行参数里
-    （argv 会暴露在 ps 输出中；临时文件权限 600，用完覆写零字节再删除）
+  * 密码/口令通过内存中的 SSH_ASKPASS 通道传给 ssh，不写临时文件或命令行参数
   * add 默认每台服务器一把独立密钥（ed25519），互不牵连
   * adopt 只登记不复制，remove 时默认不会删除你原有的密钥文件
   * 私钥目录 700、私钥文件 600、状态文件 600
@@ -146,42 +145,21 @@ def save_state(state):
 
 
 # ---------------------------------------------------------------------------
-# 密码 / 口令传递：临时文件 + SSH_ASKPASS（避免出现在 ps / argv 里）
+# 密码 / 口令传递：内存通道 + SSH_ASKPASS
 # ---------------------------------------------------------------------------
 
 class SecretHandle(object):
-    """把密码或口令写进 600 权限的临时文件供 SSH_ASKPASS 读取，退出时粉碎删除。"""
+    """Compatibility wrapper around the memory-only askpass broker."""
 
     def __init__(self, secret):
-        self.dir = tempfile.mkdtemp(prefix="sshbind-")
-        os.chmod(self.dir, 0o700)
-        pw_path = os.path.join(self.dir, "secret")
-        fd = os.open(pw_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(secret + "\n")
-        ask = os.path.join(self.dir, "askpass.sh")
-        with open(ask, "w") as f:
-            f.write("#!/bin/sh\nexec cat %s\n" % shlex.quote(pw_path))
-        os.chmod(ask, 0o700)
-        self.askpass = ask
-        self.secret_path = pw_path
+        self._broker = _extension_module("bindkit_askpass", required=True).MemoryAskpass(secret)
+        self.dir = self._broker.dir
 
     def env(self):
-        env = dict(os.environ)
-        env["SSH_ASKPASS"] = self.askpass
-        env["SSH_ASKPASS_REQUIRE"] = "force"   # OpenSSH 8.4+，强制用 askpass
-        env.setdefault("DISPLAY", ":0")
-        return env
+        return self._broker.env()
 
     def close(self):
-        try:
-            if os.path.exists(self.secret_path):
-                size = os.path.getsize(self.secret_path)
-                with open(self.secret_path, "r+b") as f:
-                    f.write(b"\0" * size)
-        except OSError:
-            pass
-        shutil.rmtree(self.dir, ignore_errors=True)
+        self._broker.close()
 
     def __enter__(self):
         return self
@@ -504,7 +482,8 @@ def ssh_base(host, user, port):
 
 def ssh_with_key(host, user, port, keyfile, certificate=None, batch=True):
     """用指定私钥构造 ssh 命令；batch=True 时禁止回退到密码，真正验证密钥生效。"""
-    cmd = ssh_base(host, user, port) + ["-i", keyfile, "-o", "IdentitiesOnly=yes"]
+    cmd = ssh_base(host, user, port) + ["-i", keyfile, "-o", "IdentitiesOnly=yes",
+                                      "-o", "PubkeyAuthentication=yes"]
     if certificate:
         cmd += ["-o", "CertificateFile=%s" % certificate]
     if batch:
@@ -630,6 +609,9 @@ def find_certificate(keyfile):
 REMOTE_INSTALL = (
     "set -e; umask 077; "
     'if [ -z "$HOME" ] || [ ! -d "$HOME" ]; then echo "SSHBIND_NO_HOME"; exit 1; fi; '
+    'SSHBIND_MODE="$(stat -L -c %a "$HOME" 2>/dev/null || :)"; '
+    'case "$SSHBIND_MODE" in [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) '
+    'if [ "$((0$SSHBIND_MODE & 022))" -ne 0 ]; then echo SSHBIND_HOME_WRITABLE; fi;; esac; '
     "if ! mkdir -p ~/.ssh || ! chmod 700 ~/.ssh; then echo SSHBIND_WRITE_FAILED; exit 1; fi; "
     "if ! touch ~/.ssh/authorized_keys || ! chmod 600 ~/.ssh/authorized_keys; then echo SSHBIND_WRITE_FAILED; exit 1; fi; "
     'KEY="$(cat)"; '
@@ -675,8 +657,10 @@ def install_pubkey(host, user, port, auth, pubkey, restrict=False):
         rc, out, err = run_ssh(cmd, stdin_data=key_line)
 
     if "SSHBIND_ADDED" in out:
+        auth['_sshbind_home_writable'] = 'SSHBIND_HOME_WRITABLE' in out
         return True, "公钥已写入远端 authorized_keys"
     if "SSHBIND_ALREADY" in out:
+        auth['_sshbind_home_writable'] = 'SSHBIND_HOME_WRITABLE' in out
         return True, "公钥此前已存在于远端（跳过重复写入）"
     if "SSHBIND_NO_HOME" in out:
         return False, ("服务器上该用户的家目录不存在或不可写，无法创建 ~/.ssh。\n"
@@ -707,7 +691,7 @@ def uninstall_pubkey(host, user, port, keyfile, pubkey, certificate=None):
 def test_connection(host, user, port, keyfile, certificate=None, timeout=20):
     """只用密钥认证做一次真实连通性测试。"""
     cmd = ssh_with_key(host, user, port, keyfile, certificate) + \
-          ["echo SSHBIND_OK && hostname && whoami"]
+          ["printf 'SSHBIND_OK\\n'; hostname 2>/dev/null || :; whoami 2>/dev/null || :"]
     rc, out, err = run_ssh(cmd, timeout=timeout)
     if rc == 0 and "SSHBIND_OK" in out:
         lines = [l for l in out.strip().splitlines() if l and l != "SSHBIND_OK"]
@@ -736,7 +720,7 @@ def _strip_block(text):
 
 def render_block(servers):
     servers = {name: server for name, server in servers.items()
-               if server.get('key') and server.get('verification_status') != 'pending'}
+               if server.get('key') and not _is_password(server) and server.get('verification_status') != 'pending'}
     if not servers:
         return ""
     parts = [BLOCK_BEGIN]
@@ -861,6 +845,7 @@ _BOOTSTRAP_FAILURES = {
     'AUTHENTICATION_FAILED': '密码认证未通过：请检查登录用户、原始密码及服务器是否允许密码认证。特殊字符无需转义。',
     'REMOTE_KEY_INSTALL_FAILED': '服务器未能保存公钥：请检查该用户的家目录和 .ssh/authorized_keys 写入权限。',
     'KEY_LOGIN_VERIFICATION_FAILED': '密码认证和公钥写入已完成，但后续密钥登录验证失败；请检查服务器公钥认证及家目录权限。',
+    'REMOTE_HOME_PERMISSIONS_UNSAFE': '密码认证和公钥写入已完成，但服务器家目录允许组或其他用户写入，可能被 OpenSSH StrictModes 拒绝；请本人移除家目录的组/其他用户写权限后重试。',
     'CONNECTION_TIMEOUT': '首次连接超时，请检查服务器地址、端口和网络。',
     'CONNECTION_REFUSED': '服务器拒绝连接，请检查端口和 SSH 服务。',
     'HOST_KEY_VERIFICATION_FAILED': '服务器主机密钥校验失败，请由本人核对主机指纹。',
@@ -928,6 +913,7 @@ def _cmd_add_verified(args):
         certificate = find_certificate(priv)
         installed, detail = install_pubkey(args.host, args.user, args.port, auth, pubkey,
                                        restrict=args.restrict)
+        home_writable = bool(auth.get('_sshbind_home_writable'))
         auth = None
         if not installed:
             warn("公钥安装未确认，未登记别名；可用正确登录密码重试。远端已有公钥未撤销。")
@@ -936,7 +922,7 @@ def _cmd_add_verified(args):
         verified, _ = test_connection(args.host, args.user, args.port, priv, certificate)
         if not verified:
             warn("公钥安装后登录验证失败，未登记别名；可用登录密码重新绑定。远端公钥未撤销。")
-            _report_bootstrap_failure('KEY_LOGIN_VERIFICATION_FAILED')
+            _report_bootstrap_failure('REMOTE_HOME_PERMISSIONS_UNSAFE' if home_writable else 'KEY_LOGIN_VERIFICATION_FAILED')
             return 1
         # main() holds the shared mutation lock. Re-read as an extra safeguard for
         # direct callers and never overwrite a newly-created alias.
@@ -1170,6 +1156,38 @@ def cmd_adopt(args):
     return 0
 
 
+def _is_password(server):
+    module = _extension_module("bindkit_password")
+    if module is not None:
+        return module.is_password(server)
+    # Recognize records even when an incomplete installation lacks transport.
+    # Execution then fails explicitly instead of ever falling back to a key.
+    return server.get("auth_type") == "password" or (server.get("auth_type") is None and not server.get("key") and bool(
+        server.get("login_credential_ref") or server.get("encrypted_login_ref")))
+
+
+def _connection_usable(server):
+    if _is_password(server):
+        return bool(server.get("login_credential_ref") and server.get("installed") and
+                    server.get("verification_status") == "verified")
+    return bool(os.path.isfile(server.get("key") or "") and server.get("installed", True) and
+                server.get("verification_status") != "pending")
+
+
+def _run_connection(server, command, stdin_data=None, timeout=120):
+    if _is_password(server):
+        return _extension_module("bindkit_password", required=True).run(
+            _self_module(), server, command, stdin_data=stdin_data, timeout=timeout)
+    argv = ssh_with_key(server["host"], server["user"], server["port"], server["key"], server.get("certificate")) + [command]
+    return run_ssh(argv, timeout=timeout, **({"stdin_data": stdin_data} if stdin_data is not None else {}))
+
+
+def _test_connection_record(server):
+    if _is_password(server):
+        return _extension_module("bindkit_password", required=True).test(_self_module(), server)
+    return test_connection(server["host"], server["user"], server["port"], server["key"], server.get("certificate"))
+
+
 def cmd_list(args):
     state = load_state()
     servers = state["servers"]
@@ -1179,19 +1197,20 @@ def cmd_list(args):
         out = []
         for name in sorted(servers):
             s = servers[name]
-            key_ok = os.path.exists(s["key"])
+            key_ok = os.path.isfile(s.get("key") or "")
             out.append({
                 "name": name,
                 "host": s["host"],
                 "user": s["user"],
                 "port": s["port"],
                 "source": s.get("source", "generated"),
-                "key_path": s["key"],
+                "key_path": s.get("key") or "",
+                "auth_type": "password" if _is_password(s) else "key",
                 "key_exists": key_ok,
                 "fingerprint": s.get("fingerprint"),
                 "installed": bool(s.get("installed", True)),
-                "usable": bool(key_ok and s.get("installed", True) and s.get("verification_status") != "pending"),
-                "verification_status": s.get("verification_status", "verified" if s.get("installed", True) else "pending"),
+                "usable": _connection_usable(s),
+                "verification_status": s.get("verification_status", "verified" if not _is_password(s) and s.get("installed", True) else "pending"),
                 "has_login_credential": bool(s.get("login_credential_ref")),
                 "has_encrypted_login": bool(s.get("encrypted_login_ref")),
             })
@@ -1210,25 +1229,28 @@ def cmd_list(args):
         s = servers[name]
         rows.append((name,
                      "%s@%s:%s" % (s["user"], s["host"], s["port"]),
-                     os.path.exists(s["key"]),
+                     os.path.isfile(s.get("key") or ""),
                      s.get("source", "generated"),
-                     s.get("installed", True)))
+                     _connection_usable(s), _is_password(s)))
 
     w = max(max(len(r[0]) for r in rows), 4)
     wh = max(len(r[1]) for r in rows)
     print()
     print("  %-*s  %-*s  %-8s  %-6s  %s" % (w, "名称", wh, "目标", "密钥", "来源", "状态"))
     print("  %s" % ("-" * (w + wh + 32)))
-    for name, target, key_ok, source, installed in rows:
+    for name, target, key_ok, source, installed, password_mode in rows:
         src = "纳管" if source == "adopted" else "生成"
-        if not key_ok:
+        if password_mode:
+            src = "密码"
+            status = "已验证" if installed else "待验证/补充凭据"
+        elif not key_ok:
             status = "密钥丢失"
         elif not installed:
             status = "待手动安装"
         else:
             status = "已绑定"
         print("  %-*s  %-*s  %-8s  %-6s  %s" % (
-            w, name, wh, target, "存在" if key_ok else "缺失", src, status))
+            w, name, wh, target, "不需要" if password_mode else ("存在" if key_ok else "缺失"), src, status))
     print()
     print("  %s" % (C_DIM + "共 %d 台。详情：sshbind show <名称>；测试：sshbind test --all" % len(rows) + C_OFF))
     return 0
@@ -1239,6 +1261,15 @@ def cmd_show(args):
     s = state["servers"].get(args.name)
     if not s:
         die("没有名为 %s 的绑定。执行 sshbind list 查看全部" % args.name)
+    if _is_password(s):
+        print()
+        for label, value in (("名称", args.name), ("地址", s.get("host")), ("用户", s.get("user")),
+                             ("端口", s.get("port")), ("认证方式", "password"),
+                             ("状态", "可用" if _connection_usable(s) else "待验证/补充凭据")):
+            print("  %-10s %s" % (label, value))
+        print("\n  连接命令：sshbind exec %s '命令'" % args.name)
+        print("  原生 ssh 不会读取 BindKit 钥匙串中的登录密码。\n")
+        return 0
     print()
     for k, label in (("name", "名称"), ("host", "地址"), ("user", "用户"),
                      ("port", "端口"), ("key", "私钥"), ("fingerprint", "指纹"),
@@ -1258,6 +1289,8 @@ def cmd_show(args):
 def cmd_pubkey(args):
     state = load_state()
     s = state["servers"].get(args.name)
+    if s and _is_password(s):
+        die("这是密码连接，没有受管公钥。")
     if s and s.get("source") == "adopted":
         pubkey = read_pubkey_for(s["key"])
         if not pubkey:
@@ -1287,12 +1320,14 @@ def cmd_test(args):
             print("  %-16s 待验证，请本人在 Web 控制台点击测试连接完成启用" % name)
             bad += 1
             continue
-        if not os.path.exists(s["key"]):
+        if not _is_password(s) and not os.path.exists(s.get("key") or ""):
             print("  %-16s %s" % (name, "私钥文件缺失，无法测试"))
             bad += 1
             continue
-        alive, details = test_connection(s["host"], s["user"], s["port"],
-                                         s["key"], s.get("certificate"))
+        try:
+            alive, details = _test_connection_record(s)
+        except Exception:
+            alive, details = False, ["连接测试失败，请检查连接信息与钥匙串状态。"]
         if alive:
             head = details[0] if details else ""
             tail = details[1] if len(details) > 1 else ""
@@ -1315,8 +1350,9 @@ def cmd_remove(args):
         die("没有名为 %s 的绑定" % args.name)
 
     adopted = s.get("source") == "adopted"
-    do_revoke = not args.no_revoke
-    delete_key = args.delete_key or (not adopted and not args.keep_key)
+    password_mode = _is_password(s)
+    do_revoke = not password_mode and not args.no_revoke
+    delete_key = not password_mode and (args.delete_key or (not adopted and not args.keep_key))
     keyfile = s.get("key")
     has_key_path = isinstance(keyfile, str) and bool(keyfile.strip()) and "\x00" not in keyfile
 
@@ -1328,7 +1364,8 @@ def cmd_remove(args):
     else:
         print("   · 跳过远端清理（--no-revoke）")
     print("   · 从 ~/.ssh/config 移除该 Host 条目")
-    print("   · 删除本地密钥文件" if delete_key else "   · 保留本地密钥文件 %s" % s["key"])
+    if not password_mode:
+        print("   · 删除本地密钥文件" if delete_key else "   · 保留本地密钥文件 %s" % s.get("key", ""))
     if adopted and not args.delete_key:
         print()
         print("  %s" % (C_DIM + "ℹ️  这是 adopt 纳管的已有密钥，默认保留不删" + C_OFF))
@@ -1373,8 +1410,8 @@ def cmd_remove(args):
         info("本地密钥已删除")
     elif delete_key:
         info("此连接没有本地密钥，无需删除")
-    else:
-        info("本地密钥已保留：%s" % s["key"])
+    elif not password_mode:
+        info("本地密钥已保留：%s" % s.get("key", ""))
 
     state["servers"].pop(args.name, None)
     save_state(state)
@@ -1638,6 +1675,13 @@ _SSH_SUDO_MODES = ("allow", "ask", "deny")
 _CONSOLE_STATUS = {"NOT_FOUND": 404, "CONFLICT": 409, "ALREADY_EXISTS": 409,
                    "INVALID_REQUEST": 400, "INVALID_PARAM": 400}
 
+_PASSWORD_FAILURES = {
+    "VAULT_UNAVAILABLE": "系统钥匙串不可用，请解锁钥匙串后重试。",
+    "NEEDS_CREDENTIAL": "登录密码不可用，请在 Web 控制台补充密码或解锁导入凭据。",
+    "CONNECTION_VERIFICATION_FAILED": "密码连接验证失败，请检查地址、端口、账号和密码；原有连接保持不变。",
+    "PASSWORD_TRANSPORT_FAILED": "密码认证通道启动失败，请检查本机 OpenSSH 与 BindKit 安装。",
+}
+
 
 def _console_fail(message, code="INVALID_REQUEST", hint=None):
     """抛给内核的四类错误：优先用内核的 ConsoleError（带精确 4xx），否则 ValueError。"""
@@ -1701,7 +1745,7 @@ def _console_ssh_item(name, srv, mod):
     key_ok = os.path.exists(srv.get("key") or "")
     installed = bool(srv.get("installed", True))
     eff = mod.effective_ssh_policy(_console_ssh_policy_map(mod), name) if mod else None
-    policy_entry = (_console_ssh_policy_map(mod).get("servers", {}) or {}).get(name) or {}
+    policy_entry = ((_console_ssh_policy_map(mod).get("servers", {}) or {}).get(name) or {}) if mod else {}
     return {
         "name": name,
         "host": srv.get("host"),
@@ -1710,7 +1754,8 @@ def _console_ssh_item(name, srv, mod):
         "source": srv.get("source", "generated"),
         "installed": installed,
         "key_exists": key_ok,
-        "usable": bool(key_ok and installed and srv.get("verification_status") != "pending"),
+        "usable": _connection_usable(srv),
+        "auth_type": "password" if _is_password(srv) else "key",
         "fingerprint": srv.get("fingerprint"),
         "created_at": srv.get("created_at"),
         "has_key": key_ok,
@@ -1722,7 +1767,7 @@ def _console_ssh_item(name, srv, mod):
         "allowed_users": eff.get("allowed_users", []) if eff else [],
         "sudo_auth": srv.get("sudo_auth", "none"),
         "has_sudo_credential": bool(srv.get("sudo_credential_ref")),
-        "verification_status": srv.get("verification_status", "verified" if installed else "pending"),
+        "verification_status": srv.get("verification_status", "verified" if not _is_password(srv) and installed else "pending"),
         "has_login_credential": bool(srv.get("login_credential_ref")),
         "has_encrypted_login": bool(srv.get("encrypted_login_ref")),
     }
@@ -1744,6 +1789,24 @@ def console_ssh_get(name):
 
 
 def console_ssh_create(body):
+    if not isinstance(body, dict):
+        raise _console_fail("请求体必须是 JSON 对象")
+    auth = body.get("auth") if isinstance(body.get("auth"), dict) else {}
+    private_key = auth.get("private_key") or body.get("private_key")
+    if private_key and (not isinstance(private_key, str) or not private_key.strip()):
+        raise _console_fail("private_key 必须是非空私钥文本")
+    auth_type = body.get("auth_type")
+    if auth_type not in (None, "key", "password"):
+        raise _console_fail("auth_type 必须是 key 或 password")
+    if auth_type == "password" or (auth_type != "key" and not private_key):
+        password = _extension_module("bindkit_password", required=True)
+        connections = _extension_module("bindkit_connections", required=True)
+        try:
+            return password.create(_self_module(), body)
+        except connections.ConnectionError as exc:
+            raise _console_fail(_PASSWORD_FAILURES.get(exc.code, str(exc)), exc.code) from None
+        except Exception:
+            raise _console_fail("密码连接保存失败，请检查连接信息与钥匙串状态。", "CONNECTION_CREATE_FAILED") from None
     # The CLI create subprocess takes the shared mutation lock itself. Do not
     # hold it while waiting for that subprocess; credential attachment takes a
     # separate lock after its verified state commit.
@@ -1884,7 +1947,11 @@ def console_ssh_update(name, body):
     if credential_fields:
         connections = _extension_module("bindkit_connections", required=True)
         try:
-            connections._validate(state["servers"][name], credential_fields)
+            server = state["servers"][name]
+            if _is_password(server):
+                _extension_module("bindkit_password", required=True).validate_update(server, credential_fields)
+            else:
+                connections._validate(server, credential_fields)
         except connections.ConnectionError as exc:
             raise _console_fail(str(exc), exc.code) from None
     if policy_fields:
@@ -1922,11 +1989,10 @@ def console_ssh_users(name):
     server = load_state()["servers"].get(name)
     if not server:
         raise _console_fail("没有这个服务器", "NOT_FOUND")
-    if not server.get("installed", True) or not os.path.isfile(server.get("key") or ""):
-        raise _console_fail("连接或私钥不可用", "CONNECTION_UNAVAILABLE")
-    command = ssh_with_key(server["host"], server["user"], server["port"], server["key"], server.get("certificate")) + ["getent passwd"]
+    if not _connection_usable(server):
+        raise _console_fail("连接或凭据不可用", "CONNECTION_UNAVAILABLE")
     try:
-        rc, out, _ = run_ssh(command, timeout=20)
+        rc, out, _ = _run_connection(server, "getent passwd", timeout=20)
     except Exception:
         raise _console_fail("读取服务器用户失败，请检查连接与 getent 支持。", "USER_DISCOVERY_FAILED") from None
     if rc or len(out) > 1024 * 1024:
@@ -1952,9 +2018,10 @@ def console_ssh_delete(name, body=None):
     args = ["remove", name, "--yes"]
     # 默认只删本地记录/密钥，不联网吊销（控制台删除要快且可离线）；
     # 需要吊销远端公钥时传 {"revoke": true}
-    if not body.get("revoke"):
+    password_mode = _is_password(state["servers"][name])
+    if password_mode or not body.get("revoke"):
         args.append("--no-revoke")
-    if body.get("delete_key"):
+    if body.get("delete_key") and not password_mode:
         args.append("--delete-key")
     if body.get("keep_key"):
         args.append("--keep-key")
@@ -1964,7 +2031,7 @@ def console_ssh_delete(name, body=None):
     if rc != 0:
         raise _console_fail("删除失败：%s" % (_last_line(err) or _last_line(out)
                                              or "未知错误"))
-    return {"ok": True, "deleted": name, "revoked": bool(body.get("revoke"))}
+    return {"ok": True, "deleted": name, "revoked": bool(body.get("revoke") and not password_mode)}
 
 
 def console_ssh_test(name):
@@ -1980,10 +2047,12 @@ def console_ssh_test(name):
             return pending.verify_pending(_self_module(), name)
         except connections.ConnectionError as exc:
             raise _console_fail(str(exc), exc.code) from None
-    if not os.path.exists(srv.get("key") or ""):
+    if not _is_password(srv) and not os.path.exists(srv.get("key") or ""):
         return {"ok": False, "usable": False, "message": "私钥文件缺失，无法测试"}
-    alive, details = test_connection(srv["host"], srv["user"], srv["port"],
-                                     srv["key"], srv.get("certificate"))
+    try:
+        alive, details = _test_connection_record(srv)
+    except Exception:
+        alive, details = False, ["连接测试失败，请检查连接信息与钥匙串状态。"]
     return {"ok": bool(alive), "usable": bool(alive),
             "message": (details[0] if details else ("连通正常" if alive else "失败")),
             "details": details[:3]}
@@ -2206,8 +2275,12 @@ def cmd_exec(args):
         die("没有名为 %s 的绑定。先执行 sshbind list 看看有哪些" % args.name)
     if not server.get("installed", True) or server.get("verification_status") == "pending":
         die("连接尚未验证启用，请在 Web 控制台补充凭据并点击测试连接。")
-    if not os.path.exists(server["key"]):
-        die("私钥缺失，无法连接：%s" % server["key"])
+    password_mode = _is_password(server)
+    if not password_mode and not os.path.exists(server.get("key") or ""):
+        die("私钥缺失，无法连接：%s" % server.get("key", ""))
+    if password_mode and not _connection_usable(server):
+        return _emit_gate_ssh(args, {"decision": "deny", "code": "LOGIN_CREDENTIAL_UNAVAILABLE",
+            "message": "登录凭据缺失或尚未验证，请在 Web 控制台更新密码并测试连接。"}, " ".join(args.command))
     command = " ".join(args.command).strip()
     if not command:
         die("请给出要执行的命令")
@@ -2241,8 +2314,7 @@ def cmd_exec(args):
             if plan.get("managed"):
                 def resolve_uid(target):
                     identity = target[1:] if target.startswith("#") else target
-                    query = ssh_with_key(server["host"], server["user"], server["port"], server["key"], server.get("certificate")) + ["id -u -- " + shlex.quote(identity)]
-                    rc, out, _ = run_ssh(query, timeout=min(20, args.timeout))
+                    rc, out, _ = _run_connection(server, "id -u -- " + shlex.quote(identity), timeout=min(20, args.timeout))
                     return int(out.strip()) if rc == 0 and re.fullmatch(r"[0-9]{1,10}", out.strip()) else None
                 plan = privilege.build_plan(command, server["user"], as_user=getattr(args, "as_user", None), allowed_users=effective.get("allowed_users", []), uid_resolver=resolve_uid)
                 if orchestration is None:
@@ -2267,6 +2339,7 @@ def cmd_exec(args):
         return _emit_gate_ssh(args, gate, command)
     started = None; managed_result = None; t0 = time.time()
     if plan and plan.get("managed"):
+        dispatched = False
         try:
             latest = load_state()["servers"].get(args.name)
             if not latest or orchestration.connection_context(latest) != context["connection"]:
@@ -2275,11 +2348,24 @@ def cmd_exec(args):
                     "error": {"code": "CONNECTION_CHANGED", "message": "连接已变化，请重新提交命令以重新审核。"}}
             else:
                 vault_module = _extension_module("bindkit_vault", required=True)
-                managed_result = privilege.execute_plan(_self_module(), server, plan, vault_module.Vault(), stdin_data=stdin_data, timeout=args.timeout)
+                vault = vault_module.Vault()
+                if password_mode:
+                    password = _extension_module("bindkit_password", required=True)
+                    with password.transport(_self_module(), server, vault=vault) as transport:
+                        dispatched = True
+                        managed_result = privilege.execute_plan(_self_module(), server, plan, vault,
+                            stdin_data=stdin_data, timeout=args.timeout, transport=transport)
+                else:
+                    dispatched = True
+                    managed_result = privilege.execute_plan(_self_module(), server, plan, vault, stdin_data=stdin_data, timeout=args.timeout)
                 started = managed_result.get("started")
-        except Exception:
-            managed_result = {"exit_code": 255, "stdout": "", "stderr": "", "started": None, "authenticated": False,
-                "error": {"code": "EXECUTION_STATE_UNKNOWN", "message": "无法确认执行状态，请勿自动重试。"}}
+        except Exception as exc:
+            started = None if dispatched else False
+            code = "EXECUTION_STATE_UNKNOWN" if dispatched else "PASSWORD_TRANSPORT_FAILED"
+            if not dispatched and getattr(exc, "code", None) in _PASSWORD_FAILURES:
+                code = exc.code
+            managed_result = {"exit_code": 255, "stdout": "", "stderr": "", "started": started, "authenticated": False,
+                "error": {"code": code, "message": _PASSWORD_FAILURES.get(code, "无法确认执行状态，请勿自动重试。")}}
         finally:
             if gate and gate.get("approval_lease"):
                 try:
@@ -2292,8 +2378,10 @@ def cmd_exec(args):
                     managed_result["exit_code"] = 255
         rc, out, err = managed_result["exit_code"], managed_result["stdout"], managed_result["stderr"]
     else:
-        cmd = ssh_with_key(server["host"], server["user"], server["port"], server["key"], server.get("certificate")) + [command]
-        rc, out, err = run_ssh(cmd, timeout=args.timeout, **({"stdin_data": stdin_data} if stdin_data is not None else {}))
+        try:
+            rc, out, err = _run_connection(server, command, stdin_data=stdin_data, timeout=args.timeout)
+        except Exception:
+            rc, out, err = 255, "", "SSH 连接失败，请检查登录凭据与钥匙串；请勿自动重试。\n"
     ms = int((time.time() - t0) * 1000)
     if args.json:
         envelope = {"alias": args.name, "host": server["host"], "user": server["user"], "command": command,

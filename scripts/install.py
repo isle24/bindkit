@@ -18,6 +18,7 @@ CONSOLE_MODULES = (
     'bindkit_privilege.py', 'bindkit_connections.py', 'bindkit_ai.py',
     'bindkit_catalog.py', 'bindkit_imports.py', 'bindkit_admin.py',
     'bindkit_orchestration.py', 'bindkit_xshell_crypto.py', 'bindkit_pending.py',
+    'bindkit_password.py', 'bindkit_askpass.py',
 )
 
 

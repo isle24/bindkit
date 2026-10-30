@@ -28,7 +28,7 @@ def _vault(vault=None):
 
 def _password(body):
     auth = body.get('auth') if isinstance(body.get('auth'), dict) else {}
-    return auth.get('password') if auth.get('password') is not None else body.get('password')
+    return auth.get('password') if auth.get('password') is not None else body.get('password', body.get('login_password'))
 
 
 def _validate_body(body):
@@ -45,7 +45,12 @@ def _validate_body(body):
             raise ConnectionError(field + ' must be nonempty text without NUL.')
     if password is not None and any(c in password for c in ('\n', '\r')):
         raise ConnectionError('Login passwords containing line breaks are unsupported.')
-    baseline = {'name': name, 'key': '', 'installed': False, 'sudo_auth': 'none', 'sudo_credential_ref': None}
+    mode = body.get('auth_type', 'key' if private_key else 'password')
+    if mode not in ('key', 'password'):
+        raise ConnectionError('auth_type must be password or key.')
+    if mode == 'password' and private_key:
+        raise ConnectionError('Password connections cannot include a private key.')
+    baseline = {'auth_type': mode, 'name': name, 'key': '', 'installed': False, 'sudo_auth': 'none', 'sudo_credential_ref': None}
     candidate = _validate(baseline, {field: body.get(field, default) for field, default in (('host', ''), ('port', 22))})
     # Imported sessions also support explicit Windows domain / email identities.
     # Keep this compatibility rule local; Linux account edits remain stricter.
@@ -89,7 +94,7 @@ def _cleanup_staged(ssh_module, vault=None, refs=(), paths=()):
     # credential/key material still referenced by persisted connection state.
     try:
         rows = list(ssh_module.load_state()['servers'].values())
-        live_refs = {row.get(field) for row in rows for field in ('login_credential_ref', 'encrypted_login_ref')}
+        live_refs = {row.get(field) for row in rows for field in ('login_credential_ref', 'encrypted_login_ref', 'sudo_credential_ref')}
         live_paths = {row.get('key') for row in rows}
         live_paths.update(path + '.pub' for path in list(live_paths) if path)
         config = getattr(ssh_module, 'SSH_CONFIG', None)
@@ -135,8 +140,16 @@ def _prepare_policy(ssh_module, name, body):
     clean = ssh_module._console_clean_ssh_policy({'servers': {name: fields}})['servers'][name]
     policy.setdefault('servers', {}).setdefault(name, {}).update(clean)
     expected = ssh_module._console_clean_ssh_policy(policy)
-    mod.write_policy('ssh', expected)
-    return mod, previous, expected
+    transaction = (mod, previous, expected)
+    try:
+        mod.write_policy('ssh', expected)
+    except (Exception, SystemExit):
+        try:
+            _restore_policy(transaction)
+        except (Exception, SystemExit):
+            raise ConnectionError('Connection policy write and restoration failed.', 'ROLLBACK_FAILED') from None
+        raise ConnectionError('Connection policy could not be saved; previous policy was retained.', 'POLICY_UPDATE_FAILED') from None
+    return transaction
 
 
 def _restore_policy(transaction):
@@ -295,13 +308,38 @@ def unlock_credentials(ssh_module, name, credentials, vault=None):
 
 
 def verify_pending(ssh_module, name, vault=None):
-    """Install/verify access using saved material and activate only after success."""
+    """Verify the chosen authentication mode and activate only after success."""
     with _lock(ssh_module):
         state = ssh_module.load_state(); old = state['servers'].get(name)
         if old is None: raise ConnectionError('Connection does not exist.', 'NOT_FOUND')
         if old.get('verification_status') != 'pending':
             raise ConnectionError('Connection is not pending verification.')
         candidate = copy.deepcopy(old); owned = []; committed = False
+        from bindkit_password import is_password, test as test_password
+        if is_password(old) or (not old.get('key') and old.get('auth_type') != 'key'):
+            if not old.get('login_credential_ref'):
+                return _failure('NEEDS_CREDENTIAL', 'Provide a login password or unlock the saved imported credential.', True)
+            try:
+                vault = _vault(vault)
+                secret = vault.get(old['login_credential_ref'])
+                if not isinstance(secret, str) or not secret:
+                    return _failure('NEEDS_CREDENTIAL', 'The saved login credential is unavailable.', True)
+            except Exception:
+                return _failure('VAULT_UNAVAILABLE', 'Unlock the OS keyring and retry verification.')
+            try:
+                alive, _ = test_password(ssh_module, candidate, vault)
+                if not alive:
+                    return _failure('CONNECTION_VERIFICATION_FAILED', 'Password verification failed; saved connection and credentials were retained.')
+                candidate.update(key='', auth_type='password', installed=True, usable=True, verification_status='verified',
+                                 fingerprint=None, certificate=None, key_type=None, revision=int(old.get('revision', 0)) + 1)
+                updated = copy.deepcopy(state); updated['servers'][name] = candidate
+                _save(ssh_module, state, updated)
+                return {'ok': True, 'usable': True, 'installed': True, 'verification_status': 'verified',
+                        'auth_type': 'password', 'name': name, 'id': candidate['id'], 'revision': candidate['revision'],
+                        'message': 'Password connection verified and activated.'}
+            except (Exception, SystemExit) as exc:
+                code = exc.code if isinstance(exc, ConnectionError) else 'CONNECTION_VERIFICATION_FAILED'
+                return _failure(code, 'Password connection activation could not be completed; inspect the saved connection before retrying.')
         try:
             key = old.get('key') or ''
             if key and os.path.isfile(key):

@@ -163,7 +163,7 @@ class AcceptanceRegressions(unittest.TestCase):
             self.ssh.save_state(state)
             return 0, '', ''
         with patch.object(self.ssh, '_run_self', side_effect=add):
-            self.ssh.console_ssh_create({'name': 'new', 'host': '127.0.0.1',
+            self.ssh.console_ssh_create({'name': 'new', 'host': '127.0.0.1', 'auth_type': 'key',
                                          'password': 'disposable-fixture', 'sudo': 'deny'})
         result = self.policy.gate_ssh('new', 'sudo true')
         self.assertEqual(result['decision'], 'deny', result)
@@ -226,7 +226,7 @@ class AcceptanceRegressions(unittest.TestCase):
             with self.subTest(credentials=bool(credentials)):
                 with patch.object(self.ssh, '_run_self', return_value=(1, '', 'fixture failure')):
                     with self.assertRaises(Exception):
-                        self.ssh.console_ssh_create(dict(name='failed', host='127.0.0.1',
+                        self.ssh.console_ssh_create(dict(name='failed', host='127.0.0.1', auth_type='key',
                                                          sudo='deny', **credentials))
                 self.assertFalse(Path(self.policy.TOOL_PATHS['ssh']['policy']).exists())
 

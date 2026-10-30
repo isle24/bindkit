@@ -397,12 +397,13 @@
       host: raw.host || '',
       port: pick(raw.port, 22),
       source: raw.source || '',
+      authType: raw.auth_type || 'key',
       installed: (raw.installed === true) ? true : (raw.installed === false ? false : null),
       usable: (raw.usable === true) ? true : (raw.usable === false ? false : null),
       usableReason: raw.usable_reason || raw.reason || '',
       verificationStatus: raw.verification_status || '',
       hasKey: raw.has_key === true || !!raw.key_path,
-      hasPassword: raw.has_password === true,
+      hasPassword: raw.has_password === true || raw.has_login_credential === true,
       hasEncryptedLogin: raw.has_encrypted_login === true,
       sudoAuth: raw.sudo_auth || 'none',
       hasSudoCredential: raw.has_sudo_credential === true,
@@ -514,8 +515,8 @@
           }
         },
         {
-          label: '已安装',
-          render: function (row) { return UI.flag(row.server.installed, '✓', '✗'); }
+          label: '认证方式',
+          render: function (row) { return UI.el('span', { text: row.server.authType === 'password' ? '密码登录' : '密钥登录' }); }
         },
         {
           label: '可用',
@@ -609,13 +610,13 @@
       var authPassword = UI.el('input', { type: 'radio', name: 'auth-method', value: 'password', checked: true, 'data-testid': 'auth-password' });
       var authKey = UI.el('input', { type: 'radio', name: 'auth-method', value: 'key', 'data-testid': 'auth-key' });
       var radios = UI.el('div', { 'class': 'radio-row' }, [
-        UI.el('label', { 'class': 'radio-card' }, [authPassword, UI.el('span', { text: '密码导入' })]),
+        UI.el('label', { 'class': 'radio-card' }, [authPassword, UI.el('span', { text: '密码登录' })]),
         UI.el('label', { 'class': 'radio-card' }, [authKey, UI.el('span', { text: '粘贴私钥内容' })])
       ]);
 
       var password = UI.textInput({
         type: 'password', autocomplete: 'new-password',
-        placeholder: '服务器登录密码（仅本次导入，不会回显）', testid: 'f-password'
+        placeholder: '服务器登录密码（保存到系统钥匙串，不会回显）', testid: 'f-password'
       });
       var privateKey = UI.textareaInput({
         placeholder: '-----BEGIN OPENSSH PRIVATE KEY-----\n…\n-----END OPENSSH PRIVATE KEY-----',
@@ -623,10 +624,10 @@
       });
 
       var passwordField = UI.field('密码', password, {
-        help: '经 stdin 导入，不会出现在命令行或日志里。', required: true
+        help: '直接使用密码连接，安全保存在本机系统钥匙串；% 和 $ 等字符按原样填写。', required: true
       });
       var keyField = UI.field('私钥内容', privateKey, {
-        help: '写入临时 0600 文件后导入，成功后立即删除。', required: true
+        help: '验证成功后保存在本机受管密钥目录，供后续连接使用。', required: true
       });
       keyField.hidden = true;
 
@@ -687,6 +688,7 @@
             host: host.value.trim(),
             port: parseInt(port.value, 10),
             user: user.value.trim(),
+            auth_type: authKey.checked ? 'key' : 'password',
             sudo: sudo.value,
             note: note.value.trim()
           };
@@ -765,7 +767,7 @@
         body: [
           UI.el('div', { 'class': 'form-grid' }, [UI.field('主机', host, { required: true }), UI.field('端口', port)]),
           UI.field('SSH 登录用户', user, { required: true }),
-          UI.field('SSH 登录密码', loginPassword, { help: '仅用来重新绑定 SSH 密钥，不修改远端账户密码。它与 sudo 提权密码独立；密码和私钥只填写一种。' }),
+          UI.field('SSH 登录密码', loginPassword, { help: server.authType === 'password' ? '更新本机保存的登录密码，留空保留；它与 sudo 提权密码独立。' : '密钥连接可用登录密码重新绑定公钥；密码和私钥只填写一种。' }),
           UI.field('替换 SSH 私钥', privateKey, { help: '仅粘贴密钥内容。验证通过后才替换；原密钥不会自动吊销。' }),
           UI.el('h3', { 'class': 'section-title', text: 'sudo 提权' }), status,
           UI.field('sudo 策略', sudo), UI.field('sudo 认证', sudoAuth),
